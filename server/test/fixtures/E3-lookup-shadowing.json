@@ -1,0 +1,71 @@
+{
+  "note": "contains-match on the display field shadows the exact key match. Recorded live.",
+  "cases": [
+    {
+      "table": "sys_user",
+      "term": "admin",
+      "currentTop": [
+        {
+          "sys_id": "dd9b3742c37030009b5efcfc5bba8fb6",
+          "display": "Certification Admin"
+        },
+        {
+          "sys_id": "8ff5b254b33213005e3de13516a8dcf7",
+          "display": "CMDB Admin"
+        },
+        {
+          "sys_id": "860a4d35eb32010045e1a5115206fe54",
+          "display": "Credential Admin"
+        },
+        {
+          "sys_id": "94a28f10b37213005e3de13516a8dcd4",
+          "display": "ECMDB Admin"
+        },
+        {
+          "sys_id": "85e3678553812300e03addeeff7b12be",
+          "display": "ESC Admin"
+        },
+        {
+          "sys_id": "a6c0b63a47702000cdd1706eecde276f",
+          "display": "Inventory Admin"
+        },
+        {
+          "sys_id": "34f7cd87ff802210459effffffffffa2",
+          "display": "Machine Identity Console Administrator"
+        },
+        {
+          "sys_id": "88aad6c5c73003005f1b78d48b9763a5",
+          "display": "ml.admin "
+        }
+      ],
+      "correct": {
+        "sys_id": "6816f79cc0a8016401c5a33be04be441",
+        "user_name": "admin",
+        "name": "System Administrator"
+      }
+    },
+    {
+      "table": "sys_scope",
+      "term": "global",
+      "currentTop": [
+        {
+          "sys_id": "dc1fcaa2c3032200f7d1ca3adfba8f1a",
+          "display": "Enhanced Global Search UI"
+        },
+        {
+          "sys_id": "global",
+          "display": "Global"
+        },
+        {
+          "sys_id": "68ed3c3fd5c9b79cc0673a1552d23c8f",
+          "display": "sn-component-workspace-global-search"
+        }
+      ],
+      "correct": {
+        "sys_id": "global",
+        "scope": "global",
+        "name": "Global"
+      }
+    }
+  ]
+}

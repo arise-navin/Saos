@@ -1,0 +1,2872 @@
+import { table, testConnection } from '../servicenow/client.js';
+import { getSchema, toCompactSchema, referenceLookup, tableLookup, tableExists } from '../servicenow/schema.js';
+import { flowDesignerTablePolicy } from './write-guard.js';
+import {
+  flowExecutionsFor, flowExecution, auditFor, journalFor, slasFor, ciRelationshipsFor,
+  waitForFlowExecution, WAIT_LIMITS,
+} from '../servicenow/diagnostics.js';
+import { catalog, variablePayload } from '../servicenow/catalog.js';
+import { EXTENDED_TOOLS } from './tools-extended.js';
+import { flows, designFlowBlueprint } from '../servicenow/flows.js';
+import { capability, createLiveFlow, listManaged, removeManaged, smokeRun, verify, activateManagedFlow } from '../servicenow/fluent.js';
+import { recordIntendedState } from '../servicenow/post-install-state.js';
+import { listSlas, getSla, slaMeta, createSla, verifySla } from '../servicenow/sla.js';
+import { listPoliciesForItem, itemVariables, createPolicy, CONDITION_OPERATORS } from '../servicenow/catalogPolicy.js';
+import { aclReport, aclDiff, explainAclReport } from '../servicenow/acl.js';
+import { search } from '../memory/recall.js';
+import { recordCalculatedFields, listFacts, recordFact } from '../memory/facts.js';
+import { searchKnowledge, knowledgeStats } from '../knowledge/store.js';
+import { resolveConflict, AUTHORITY_ORDER } from '../knowledge/precedence.js';
+import {
+  recordObservation, listObservations, observationStats,
+  OBSERVATION_CATEGORIES, EVIDENCE_KINDS,
+} from '../knowledge/observations.js';
+import { listApplications } from '../servicenow/applications.js';
+import { listCapturedSets, setContents } from '../servicenow/transport.js';
+import { createApplication, vendorPrefix, suggestScopeName, validateScopeName, studioSteps, MAX_SCOPE_LENGTH } from '../servicenow/app-create.js';
+import { startImpersonation, endImpersonation, switchImpersonation, impersonationStatus } from './impersonation-ops.js';
+import { whoReallyDid, impersonationAuditForSession, impersonationAuditForTarget } from '../memory/impersonation-audit.js';
+import { writeAsCurrentIdentity } from './impersonated-write.js';
+import { getDbaContext } from '../servicenow/dba-context.js';
+import { metaQuery } from '../servicenow/dba-metadata.js';
+import {
+  getTable as dbaGetTable,
+  listFields as dbaListFields,
+  getField as dbaGetField,
+  getHierarchy as dbaGetHierarchy,
+  getReferences as dbaGetReferences,
+  resolveReference as dbaResolveReference,
+  dotWalk as dbaDotWalk,
+  classify as dbaClassify,
+  resolveIdentifier as dbaResolveIdentifier,
+  listChoices as dbaListChoices,
+  getRelationships as dbaGetRelationships,
+  listIndexes as dbaListIndexes,
+  generateSchemaMap as dbaSchemaMap,
+} from '../servicenow/dba-schema.js';
+import {
+  analyzeImpact as dbaAnalyzeImpact,
+  classifyOperation as dbaClassifyOperation,
+  checkIntegrity as dbaCheckIntegrity,
+  preflight as dbaPreflight,
+} from '../servicenow/dba-impact.js';
+import { appendMutation, mutationsForSession } from '../memory/ledger.js';
+import {
+  createTable as dbaCreateTable,
+  augmentTable as dbaAugmentTable,
+  addField as dbaAddField,
+  classifyColumnTarget as dbaClassifyColumnTarget,
+  modifyField as dbaModifyField,
+  liveTableConstraints as dbaTableConstraints,
+} from '../servicenow/dba-authoring.js';
+import {
+  setFieldValue as dbaSetFieldValue,
+  deleteRecord as dbaDeleteRecord,
+  createRecord as dbaCreateRecord,
+  readRecord as dbaReadRecord,
+  destructiveGate as dbaDestructiveGate,
+  executeIrreversible as dbaExecuteIrreversible,
+  snapshotBeforeDestruction as dbaSnapshot,
+  deleteRecoveryStatement as dbaRecoveryStatement,
+  dropField as dbaDropField,
+} from '../servicenow/dba-data.js';
+import { contractFromRequest } from './appbuild/architecture.js';
+
+const cellValue = (c) => (c && typeof c === 'object' && 'value' in c ? c.value : c);
+
+const slugOf = (value) => String(value ?? '')
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, '_')
+  .replace(/^_+|_+$/g, '')
+  .replace(/_{2,}/g, '_') || null;
+
+function requestContractRefusal(toolName, input = {}, ctx = {}) {
+  const contract = contractFromRequest(ctx.userText || ctx.goal || '');
+  if (!contract.explicitTable && !contract.flowRequested && !contract.uiPolicyRequested && !contract.forbidHardcodedSysIds) return null;
+
+  if (toolName === 'dba_create_table' && contract.explicitTable) {
+    const spec = input.spec ?? input;
+    const candidates = [spec?.name, spec?.label].map(slugOf).filter(Boolean);
+    const wanted = contract.tableSlug;
+    const matches = wanted && candidates.some((v) => v === wanted || v.endsWith(`_${wanted}`));
+    if (!matches) {
+      return {
+        ok: false, refused: true, reason: 'request_contract_table_mismatch', tool: toolName,
+        message: `Refused before execution: the user asked for one table "${contract.tableName ?? contract.tableLabel}", `
+          + `but this tool call would create "${spec?.label ?? spec?.name ?? '(unnamed)'}". Nothing was written.`,
+      };
+    }
+  }
+
+  if (toolName === 'design_flow_blueprint' && contract.flowRequested) {
+    return {
+      ok: false, refused: true, reason: 'request_contract_blueprint_only', tool: toolName,
+      message: 'Refused before execution: the user asked to create a Flow Designer flow, but this call only designs a blueprint. '
+        + 'A blueprint is not a created flow, so nothing was written.',
+    };
+  }
+
+  if (contract.uiPolicyRequested && ['dba_create_table', 'create_flow_live', 'design_flow_blueprint'].includes(toolName)) {
+    return {
+      ok: false, refused: true, reason: 'request_contract_ui_policy_unsupported', tool: toolName,
+      message: 'Refused before execution: the user asked for a UI Policy, but this tool path cannot create UI Policies. '
+        + 'The build must not silently skip that requirement.',
+    };
+  }
+
+  if (contract.forbidHardcodedSysIds) {
+    const text = JSON.stringify(input ?? {});
+    const hit = /\b[0-9a-f]{32}\b/i.exec(text);
+    if (hit) {
+      return {
+        ok: false, refused: true, reason: 'hardcoded_sys_id', tool: toolName,
+        message: `Refused before execution: the user said not to hard-code sys_ids, but this ${toolName} call contains literal sys_id ${hit[0]}. `
+          + 'Resolve the record by name/lookup and carry it as a referenced result instead.',
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * WI-5 — the application-creation capability boundary.
+ *
+ * Measured in the transcript: `create_record` on `sys_scope` produced a record
+ * with `sys_class_name: "sys_scope"`, `scope: ""` and no version — a HUSK. It
+ * never appears in Studio's application list and nothing can be developed in
+ * it. Worse, the model had correctly refused one turn earlier, then complied
+ * with invented field values, so guidance alone demonstrably does not hold.
+ *
+ * A real custom application is a `sys_app` record (which extends `sys_scope`)
+ * with a technical `scope` name of the form `x_<vendor>_<name>`, a version and
+ * a vendor prefix — created through Studio or the SDK, never by inserting the
+ * parent table over REST.
+ */
+const UNCREATABLE_TABLES = {
+  sys_scope: 'application scope',
+  sys_app: 'custom application',
+};
+
+/**
+ * SESSION 1 / WI-4 — THE LAST LINE INSIDE THE THREE RECORD TOOLS.
+ *
+ * The plan validator and the pre-card gate check refuse first; this runs when a
+ * call reaches `execute` anyway. Two refusals, each a first-class RESULT the
+ * mutation pipeline reads as not-attempted (so no ledger row, no drop
+ * registered, no "1 mutation" in a summary):
+ *
+ *   policy_refused   the table is `sys_hub_*` — Flow Designer artifacts are
+ *                    authored through the SDK, never over REST
+ *   unknown_table    the bound instance has no such table
+ *
+ * Nothing reaches the wire on either.
+ */
+async function refuseRecordWrite(tool, t) {
+  const policy = flowDesignerTablePolicy(t);
+  if (!policy.allowed) {
+    return { ok: false, refused: true, reason: policy.reason, table: String(t ?? ''), tool, message: policy.message };
+  }
+  if (!(await tableExists(t))) {
+    return {
+      ok: false, refused: true, reason: 'unknown_table', table: String(t ?? ''), tool,
+      message: `"${t}" is not a table on the bound instance (no sys_db_object row carries that name). Nothing was written. `
+        + 'Find the real table with lookup_table or get_table_schema before writing; do not guess a name.',
+    };
+  }
+  return null;
+}
+
+export function assertCreatableTable(t) {
+  const label = UNCREATABLE_TABLES[String(t || '').trim()];
+  if (!label) return;
+  throw Object.assign(new Error(
+    `create_record cannot create ${label === 'custom application' ? 'a custom application' : 'an application scope'}. Inserting into ${t} over REST produces a non-functional husk, `
+    + 'not an application: sys_class_name stays "sys_scope" instead of becoming "sys_app", the technical '
+    + '`scope` name is empty (a real one looks like x_<vendor>_<name>), there is no version, and Studio will '
+    + 'not list it — nothing can be developed inside it. '
+    + 'Use the create_application tool instead: it goes through the ServiceNow SDK, which scaffolds a real '
+    + 'sys_app with a valid scope name, version and vendor prefix. The manual route is All → Studio → '
+    + 'Create Application. Do not submit an insert on this table.'
+  ), { status: 422, detail: { table: t, reason: 'application-husk-guard', tool: 'create_record' } });
+}
+
+/**
+ * WI-ACL-1 — the ACL write tools' `execute` must be UNREACHABLE, and must say so.
+ *
+ * `create_acl` / `update_acl` / `delete_acl` never execute: the orchestrator
+ * intercepts their gated descriptor and routes the whole call through the
+ * elevation pipeline before `executeTool` is reached. Leaving `execute` as a
+ * REST write "just in case" would be the worst possible fallback — un-elevated
+ * writes to `sys_security_acl` are denied SILENTLY (WI-1), so the tool would
+ * report success while changing nothing, and a user would believe access had
+ * been altered when it had not.
+ *
+ * So it throws. If the interception is ever removed, reordered, or the
+ * classifier entry is dropped, this is a loud failure at the exact moment the
+ * guarantee breaks — not a quiet no-op discovered later by someone who trusted
+ * a green tick.
+ */
+function unreachableAclWrite(toolName) {
+  return Object.assign(new Error(
+    `${toolName} reached the ordinary tool path, which must never happen. ACL writes are only valid through the `
+    + 'elevation gate (classifier -> eligibility -> spec validation -> approval -> elevated atomic write -> read-back). '
+    + 'An un-elevated write to sys_security_acl is DENIED SILENTLY, so nothing was attempted rather than something '
+    + 'appearing to work. This is a wiring defect in the orchestrator, not a problem with the request.'
+  ), { status: 500, detail: { tool: toolName, reason: 'acl-write-bypassed-elevation-gate' } });
+}
+
+/**
+ * The human-readable half of an ACL descriptor.
+ *
+ * `descriptor.requested` is what the pre-gate guards and the audit ledger see,
+ * so it holds the REQUEST in the user's terms (roles by name, the table, the
+ * operation) rather than `sys_security_acl` column values — which at this point
+ * do not exist yet, and which would not tell a reader what the rule does even
+ * once they did. The resolved column payload is built later, after validation.
+ */
+function aclDescriptorSummary(input = {}) {
+  const summary = {};
+  for (const k of ['table', 'field', 'operation', 'decision_type', 'data_condition', 'script', 'applies_to', 'description', 'scope']) {
+    if (input[k] !== undefined && input[k] !== null && input[k] !== '') summary[k] = String(input[k]);
+  }
+  for (const k of ['active', 'admin_overrides']) {
+    if (input[k] !== undefined && input[k] !== null) summary[k] = String(input[k]);
+  }
+  if (Array.isArray(input.roles)) summary.roles = input.roles.join(', ');
+  if (Array.isArray(input.security_attributes) && input.security_attributes.length) summary.security_attributes = input.security_attributes.join(', ');
+  return summary;
+}
+
+/**
+ * Tool registry — the agent's hands.
+ * `mutating: true` tools are intercepted by the approval gate unless the user
+ * has enabled auto-approve (same idea as Claude Code's permission prompts).
+ *
+ * `describeWrite(input, result)` — OPTIONAL, and only on mutators. It tells the
+ * mutation pipeline what a tool actually wrote, so post-write verification
+ * (WI-1) can diff the request against the record without guessing which part of
+ * a tool's arguments was the payload. Shape:
+ *
+ *   { table, sys_id, operation: 'insert' | 'update' | 'delete', requested }
+ *
+ * Returning `null` means "not verifiable by field diff", and that is a real
+ * answer rather than a gap: the SDK-backed tools (create_flow_live,
+ * create_ui_policy) and the verifiers already read their work back off the
+ * instance through their own paths, and forcing a second diff onto them would
+ * report a shape mismatch as a lost write. Those say so in `verifiedBy`.
+ */
+export const TOOLS = [
+  {
+    name: 'test_connection',
+    description: 'Verify the configured ServiceNow instance is reachable and authenticated.',
+    mutating: false,
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    execute: () => testConnection(),
+  },
+  {
+    name: 'get_table_schema',
+    description:
+      'Get the field schema for any ServiceNow table, walking the inheritance chain (e.g. incident -> task). ' +
+      'Returns EVERY field with its type, reference target, and mandatory flag — so if a field is not in the list, ' +
+      'it does not exist on that table, and you can say so with confidence. Choice values are counted, not listed; ' +
+      'pass expand:["state","priority"] to see the values for the specific fields you are about to write to. ' +
+      'ALWAYS call this before creating or updating records on an unfamiliar table.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string', description: 'Table name, e.g. incident, sc_cat_item' },
+        expand: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Field names whose choice values you need in full. Keep this short — name only the fields the current task touches.',
+        },
+        full: {
+          type: 'boolean',
+          description: 'Rarely needed. Returns labels, max lengths and defaults for every field as well — large enough to crowd out the rest of the conversation.',
+        },
+      },
+      required: ['table'],
+    },
+    execute: async ({ table: t, expand, full }) => {
+      const schema = await getSchema(t);
+      // A-4 write path: fields the platform computes accept a write and then
+      // discard it (trap #5's family). Recording them here means the next
+      // session starts knowing, instead of rediscovering it by shipping a bug.
+      try { recordCalculatedFields(t, schema); } catch { /* the ledger is never load-bearing for a read */ }
+      /*
+       * D-7 — compact by default, and the default is the correctness fix.
+       *
+       * MEASURED on dev442675: `incident` carries 91 fields and serialises to
+       * 29,152 characters, about 8,330 tokens. The agent's history budget at
+       * the time was 5,452, so one schema read was 153% of everything the
+       * conversation could hold — and the orchestrator's 8,000-character result
+       * cap hid that instead of fixing it. Fields are sorted alphabetically, so
+       * the cut landed after `company`: the agent saw 26 of 91 fields, never
+       * saw `state`, `priority` or `assignment_group`, and — because `u_`
+       * fields sort last — could not observe that a custom field was ABSENT.
+       *
+       * Compact mode is 1,007 tokens for the same table, 8.3x smaller, with
+       * every field name present. `full` stays for the UI and codegen paths
+       * that genuinely need labels and defaults.
+       */
+      return full ? schema : toCompactSchema(schema, { expand });
+    },
+  },
+  {
+    name: 'lookup_reference',
+    description:
+      'Resolve a reference field value: search a table and get back ranked sys_id + display pairs. '
+      + 'Use this to turn names like "Service Desk" or "Abel Tuter" into sys_ids BEFORE writing them into reference fields. Never invent sys_ids. '
+      + 'Results are ranked exact-key > exact-display > starts-with > contains, and each carries a matchType: searching sys_user for "admin" '
+      + 'matches the user whose user_name IS admin, not every display name containing the word. '
+      + 'If the response says ambiguous:true, no single exact match was found and the top hit is a guess — CONFIRM it with the user before '
+      + 'putting it in a mutation payload. Read-only use may proceed.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string', description: 'Referenced table, e.g. sys_user, sys_user_group, cmdb_ci' },
+        search: { type: 'string', description: 'Text to search for' },
+        limit: { type: 'number' },
+      },
+      required: ['table'],
+    },
+    execute: async ({ table: t, search, limit }) => {
+      const rows = await referenceLookup(t, search || '', limit || 10);
+      /*
+       * PHASE 13 — A BROWSE IS NOT A RESOLUTION.
+       *
+       * `referenceLookup` computes `ambiguous` as `Boolean(term) && …`, so with
+       * NO search term it answers `ambiguous: false` and puts the first row of
+       * an alphabetical listing in `resolved`. For the interactive picker that
+       * is right — a person is scrolling a list and will click one.
+       *
+       * For this tool it is dangerous, because `resolved.sys_id` is a declared
+       * OUTPUT that a later step can reference into a mutation. Measured: the
+       * model wrote `{ table: 'incident', display: 'INC0010001' }` — `display`
+       * is not a declared input, so `search` arrived undefined, and the plan
+       * would have carried an arbitrary first incident into an update.
+       *
+       * So the verdict is tightened HERE rather than in `referenceLookup`,
+       * which the picker shares and which is not wrong for its own purpose.
+       * A resolution means one record matched the term exactly; a browse, a
+       * starts-with and a contains all mean "here are some candidates", and a
+       * candidate is exactly what must not become a mutation target.
+       */
+      const EXACTISH = new Set(['id', 'exact', 'exact-display']);
+      const resolvedExactly = Boolean(rows.resolved) && EXACTISH.has(rows.resolved.matchType);
+      const ambiguous = rows.ambiguous || !resolvedExactly;
+
+      // The array's own properties do not survive JSON.stringify, and the
+      // ambiguity verdict is the whole point of WI-4 — so it is lifted into an
+      // object the model actually receives.
+      return {
+        table: t, search: search || '', ambiguous, resolved: rows.resolved,
+        ...(ambiguous && rows.length
+          ? {
+            confirmBefore: rows.confirmBefore
+              ?? (search
+                ? 'Do not use this in a mutation payload without confirming it with the user — no single exact match was found.'
+                : 'No search term was given, so nothing was resolved — these are the first rows of the table, '
+                  + 'not an answer. Name what you are looking for.'),
+          }
+          : {}),
+        results: [...rows],
+      };
+    },
+    /*
+     * PHASE 13 — WHAT A LATER STEP MAY READ, AND WHEN IT MAY NOT.
+     *
+     * This is the tool that turns "Abel Tuter" into an identity, so it is the
+     * one place where a wrong answer puts a mutation on the wrong person's
+     * record. Two declarations carry that weight:
+     *
+     *   `path` reads the RESOLVED top hit — not the results array, so a plan
+     *   cannot reach past the ranking into "the second one".
+     *
+     *   `withheldWhen: { ambiguous: true }` is the important half. When no
+     *   single exact match was found, this tool already says so, and the output
+     *   then DOES NOT EXIST. A reference to it resolves to nothing, the step
+     *   stops, and the question reaches a person — which is the whole rule:
+     *   never silently choose one of several people.
+     *
+     * So a plan can be written as "look them up, then assign to what the lookup
+     * found", and that plan is safe by construction: it either resolves to one
+     * unambiguous identity or it does not run.
+     */
+    outputs: {
+      sys_id: {
+        type: 'sys_id',
+        path: ['resolved', 'sys_id'],
+        withheldWhen: { ambiguous: true },
+      },
+      display: {
+        type: 'string',
+        path: ['resolved', 'display'],
+        withheldWhen: { ambiguous: true },
+      },
+    },
+  },
+  {
+    name: 'lookup_table',
+    description: 'Find ServiceNow tables by name or label (searches sys_db_object). Use when you need the exact table name for a record producer, list collector, or flow trigger.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { search: { type: 'string' } },
+      required: ['search'],
+    },
+    execute: ({ search }) => tableLookup(search),
+  },
+  {
+    name: 'query_records',
+    description:
+      'Query any ServiceNow table with an encoded query. Returns records with both raw values and display values for every field (reference fields come back as {value: sys_id, display_value: label}).',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string' },
+        query: { type: 'string', description: 'ServiceNow encoded query, e.g. active=true^priority=1' },
+        fields: { type: 'string', description: 'Comma-separated field list (keep results small)' },
+        limit: { type: 'number' },
+        order_by_desc: { type: 'string' },
+      },
+      required: ['table'],
+    },
+    /*
+     * PHASE 12 — readable by a later step, and ONLY from the first row.
+     *
+     * A query returns many rows. "The sys_id of the query" is meaningless
+     * unless the plan says WHICH row, so `fromFirstRow` makes that explicit
+     * rather than letting this layer quietly pick one. A plan that wants a
+     * single record should narrow its query to one; if it does not, it is
+     * saying "the first match", and the declaration says so out loud.
+     */
+    outputs: {
+      sys_id: { type: 'sys_id', from: 'sys_id', fromFirstRow: true },
+      /*
+       * PHASE 14 — the same reference fields `get_record` declares, and for the
+       * same reason. Found by the real model on the real instance: asked to
+       * investigate an incident it wrote the obvious plan —
+       *
+       *   step_1  query_records  number=INC0010001
+       *   step_2  get_record     sys_id = $ref step_1.result.assignment_group
+       *   step_3  get_record     sys_id = $ref step_1.result.assigned_to
+       *   ...
+       *
+       * — and every one of those references was refused as
+       * `reference_unknown_output`, because the traversal outputs had been
+       * declared on `get_record` alone. Finding a record by its NUMBER is a
+       * query, so a plan that starts from a number can only continue through
+       * this tool. The full reasoning, and the tradeoff it accepts, is on
+       * `get_record`; it applies identically here.
+       *
+       * `fromFirstRow` carries the same meaning it carries for `sys_id`: these
+       * describe the FIRST matching row, and a plan that has not narrowed its
+       * query to one row is saying "the first match" out loud.
+       */
+      caller_id: { type: 'sys_id', from: 'caller_id', fromFirstRow: true },
+      assigned_to: { type: 'sys_id', from: 'assigned_to', fromFirstRow: true },
+      assignment_group: { type: 'sys_id', from: 'assignment_group', fromFirstRow: true },
+      cmdb_ci: { type: 'sys_id', from: 'cmdb_ci', fromFirstRow: true },
+    },
+    execute: ({ table: t, query, fields, limit, order_by_desc }) => {
+      /*
+       * PHASE 15 — A TOOL MUST FETCH WHAT IT PROMISES.
+       *
+       * MEASURED, and it silently destroyed whole investigations. Asked "what
+       * changed on INC0010093?", the model planned a perfectly good ten-step
+       * investigation whose first step narrowed `fields` to the columns it
+       * wanted to read — omitting `sys_id`. The read succeeded, produced no
+       * declared outputs, and every one of the nine following steps failed with
+       * "step_1 did not produce sys_id". The diagnosis came back with zero
+       * facts, which was honest and useless.
+       *
+       * The declared outputs are a CONTRACT this tool offers to later steps, so
+       * honouring it cannot depend on the caller having remembered to ask for
+       * the right columns. When `fields` is narrowed, the declared output
+       * columns are added back. When it is absent the platform returns
+       * everything and there is nothing to fix.
+       *
+       * The caller still gets exactly what it asked for, plus the columns the
+       * tool had already promised to be able to hand on.
+       */
+      const declared = ['sys_id', 'caller_id', 'assigned_to', 'assignment_group', 'cmdb_ci'];
+      const asked = typeof fields === 'string' && fields.trim() ? fields.split(',').map((f) => f.trim()) : null;
+      const merged = asked ? [...new Set([...asked, ...declared])].join(',') : fields;
+      return table.query(t, {
+        query, fields: merged, limit: Math.min(limit || 10, 50), orderByDesc: order_by_desc,
+      });
+    },
+  },
+  {
+    name: 'get_record',
+    description: 'Fetch a single record by sys_id from any table.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { table: { type: 'string' }, sys_id: { type: 'string' } },
+      required: ['table', 'sys_id'],
+    },
+    execute: ({ table: t, sys_id }) => table.get(t, sys_id),
+    /*
+     * PHASE 12 — what a LATER step may read from this one.
+     *
+     * `from` names the field of the result to read, and the extractor unwraps
+     * the Table API's `{ display_value, value }` cell. That unwrapping is
+     * exactly why an output must be DECLARED rather than scraped: `.sys_id` on
+     * a raw row is an object, not an id, and a plan should not have to know
+     * the transport's shape to say "the record this read found".
+     *
+     * Only `sys_id` is declared, because only `sys_id` exists on every table
+     * this tool can read. Declaring `number` here would make a plan's validity
+     * depend on which table it happened to name, and a reference to an
+     * undeclared output is refused at validation rather than at run time.
+     *
+     * PHASE 14 REVISITS THAT, NARROWLY, AND ACCEPTS THE COST IT NAMES.
+     *
+     * A diagnosis has to walk from a record to the records it points at —
+     * incident to caller, to assignment group, to configuration item — and
+     * §15 requires that walk to use the Phase 12 resolver rather than any
+     * ad-hoc substitution. Reaching a reference field's value is the only way
+     * to do that, so these four are declared.
+     *
+     * The objection above is real and is not being waved away: on a table that
+     * has no `caller_id`, a plan referencing `step_1.result.caller_id`
+     * validates and then fails when it runs. That is a genuine downgrade from
+     * plan-time refusal to run-time refusal, and it is accepted for exactly one
+     * reason — it still FAILS CLOSED. `extractOutputs` omits an output whose
+     * field is absent, the consumer gets `missing_step_output`, and the step
+     * does not run. Nothing is substituted and nothing is guessed; the refusal
+     * simply arrives later than it would for a misspelled output name.
+     *
+     * What is NOT declared is anything table-specific that is not a reference:
+     * no `number`, no `state`, no `short_description`. Those would carry the
+     * same cost without buying the traversal that made it worth paying.
+     *
+     * Each of these holds a sys_id when it is set, which is why the type is
+     * `sys_id` and why the extractor's cell-unwrapping produces an identity
+     * rather than a display name. An EMPTY reference field yields `''`, and
+     * Phase 12 already refuses that with `null_required_output` — so an
+     * unassigned incident cannot carry a blank identity into a later read.
+     */
+    outputs: {
+      sys_id: { type: 'sys_id', from: 'sys_id' },
+      caller_id: { type: 'sys_id', from: 'caller_id' },
+      assigned_to: { type: 'sys_id', from: 'assigned_to' },
+      assignment_group: { type: 'sys_id', from: 'assignment_group' },
+      cmdb_ci: { type: 'sys_id', from: 'cmdb_ci' },
+    },
+  },
+  {
+    name: 'create_record',
+    description:
+      'Create a record in any ServiceNow table. Reference fields must contain sys_ids you resolved with lookup_reference. Requires user approval.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string' },
+        data: { type: 'object', description: 'Field/value pairs' },
+        force: {
+          type: 'boolean',
+          description:
+            'Only set this after a write was reported as silently dropped AND you have stated a CHANGED strategy. '
+            + 'It re-submits a write the harness has proof does not land. Retrying identically without a change wastes an approval.',
+        },
+      },
+      required: ['table', 'data'],
+    },
+    // B7 — routes through the impersonation wrapper while mode is active, so
+    // the record is created BY the impersonated user rather than merely on
+    // their behalf. Nothing changes when mode is off.
+    impersonable: true,
+    execute: async ({ table: t, data }, ctx = {}) => {
+      /*
+       * THE STATIC GUARD RUNS FIRST, BEFORE ANYTHING TOUCHES THE NETWORK.
+       *
+       * `assertCreatableTable` is a lookup against a constant map — it already
+       * knows `sys_scope` can never be created this way. It used to run AFTER
+       * `refuseRecordWrite`, which calls `tableExists` and therefore queries
+       * `sys_db_object` on the instance, and that ordering cost two things:
+       *
+       *   - a pointless round-trip for a write we were always going to refuse;
+       *   - the refusal itself, whenever the instance was unreachable. Found
+       *     by switching instances: with bad credentials the read threw 401 and
+       *     the caller was told their password was wrong, when the real answer
+       *     was "you cannot create an application over REST at all".
+       *
+       * A guard that needs the network to say something it already knows is a
+       * guard that stops working exactly when things are going wrong.
+       */
+      assertCreatableTable(t);
+      const refusal = await refuseRecordWrite('create_record', t);
+      if (refusal) return refusal;
+      return writeAsCurrentIdentity({
+        ctx, tool: 'create_record', table: t, operation: 'create', data,
+        direct: () => table.create(t, data),
+      });
+    },
+    /*
+     * PHASE 17 — THE ONE THING A LATER STEP NEEDS FROM A CREATE.
+     *
+     * Phase 12 declared outputs on the READ tools, because that was the shape
+     * every plan had then: find a record, then act on it. "Create a record and
+     * then prove what happened to it" is the other shape, and without a
+     * declared output it is unplannable — a step referencing
+     * `step_1.result.sys_id` is refused at validation as an unknown output, and
+     * the only alternative is to write an identity that does not exist yet,
+     * which `sys_id_not_an_identity` correctly refuses too.
+     *
+     * Only `sys_id`, for the reason `get_record` declares only `sys_id`: it is
+     * the one field every table returns. The insert response carries the whole
+     * record, and declaring more would make a plan's validity depend on which
+     * table it happened to name.
+     *
+     * This widens nothing. The reference resolves only after the create has run
+     * and been verified, `checkWriteTarget` then sees a sys_id with real
+     * provenance from this session's own tool result, and every later step
+     * passes the gate it always did.
+     */
+    outputs: {
+      sys_id: { type: 'sys_id', from: 'sys_id' },
+    },
+    describeWrite: ({ table: t, data }, result) => ({
+      table: t, operation: 'insert', requested: data || {}, sys_id: cellValue(result?.sys_id),
+    }),
+  },
+  {
+    name: 'update_record',
+    description: 'Update a record by sys_id. Requires user approval.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string' },
+        sys_id: { type: 'string' },
+        data: { type: 'object' },
+        force: {
+          type: 'boolean',
+          description:
+            'Only set this after a write was reported as silently dropped AND you have stated a CHANGED strategy. '
+            + 'It re-submits a write the harness has proof does not land. Retrying identically without a change wastes an approval.',
+        },
+      },
+      required: ['table', 'sys_id', 'data'],
+    },
+    impersonable: true,
+    execute: async ({ table: t, sys_id, data }, ctx = {}) => {
+      const refusal = await refuseRecordWrite('update_record', t);
+      if (refusal) return refusal;
+      return writeAsCurrentIdentity({
+        ctx, tool: 'update_record', table: t, sysId: sys_id, operation: 'update', data,
+        direct: () => table.update(t, sys_id, data),
+      });
+    },
+    describeWrite: ({ table: t, sys_id, data }) => ({
+      table: t, operation: 'update', requested: data || {}, sys_id,
+    }),
+  },
+  /* ================================================================== *
+   * PHASE 15 - THE DIAGNOSTIC EVIDENCE SURFACES.
+   *
+   * Six read-only tools that answer "why did this happen?" rather than "what
+   * is true now". Every one is `mutating: false` (§20), scoped to a subject
+   * record (§19), and returns the NORMALISED shape from
+   * `servicenow/diagnostics.js` rather than raw rows (§30).
+   *
+   * They exist as separate tools rather than as `query_records` against
+   * `sys_flow_context` and friends because a normalisation the model performs
+   * is a normalisation the model can get wrong. `query_records` would hand back
+   * 38 columns and leave "did the automation fail?" to be inferred from a
+   * choice value, which is exactly the inference §7 says must be deterministic.
+   * ================================================================== */
+  {
+    name: 'find_flow_executions',
+    description:
+      'Find automation (Flow Designer) executions whose SUBJECT is a specific record. '
+      + 'Answers whether anything ran at all, and in what state. If nothing ran the result is '
+      + 'NO_EXECUTION_FOUND, which does NOT mean the automation failed - it means no execution '
+      + 'evidence exists. Read-only.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string', description: 'The subject table, e.g. "incident" or "task_sla".' },
+        sys_id: { type: 'string', description: 'The subject record sys_id.' },
+        limit: { type: 'number', description: 'Max executions (platform ceiling 10).' },
+      },
+      required: ['table', 'sys_id'],
+    },
+    execute: (args) => flowExecutionsFor(args),
+    outputs: {
+      /* The chain a diagnosis walks: find executions, then read the most recent
+       * one in detail. The result is an OBJECT whose `executions` array is
+       * already ordered newest-first, so the output names that element rather
+       * than relying on `fromFirstRow`, which is for list RESULTS. */
+      state: { type: 'string', from: 'state' },
+      count: { type: 'number', from: 'count' },
+      found: { type: 'boolean', from: 'found' },
+      execution_sys_id: { type: 'sys_id', path: ['executions', '0', 'sys_id'] },
+    },
+  },
+  {
+    name: 'get_flow_execution',
+    description:
+      'Read one automation execution in detail: its flow, subject record, state, timing and '
+      + 'error message. Read-only.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { sys_id: { type: 'string', description: 'The sys_flow_context sys_id.' } },
+      required: ['sys_id'],
+    },
+    execute: (args) => flowExecution(args),
+    outputs: {
+      state: { type: 'string', path: ['execution', 'state'] },
+      error: { type: 'string', path: ['execution', 'error'] },
+      execution_id: { type: 'string', path: ['execution', 'execution_id'] },
+      flow_sys_id: { type: 'sys_id', path: ['execution', 'flow', 'sys_id'] },
+    },
+  },
+  {
+    /* ================================================================== *
+     * PHASE 17 — THE BOUNDED WAIT (Sec.19, Sec.20).
+     *
+     * `find_flow_executions` answers "what is the state right now", which is
+     * the wrong question immediately after creating a record: the flow has not
+     * started yet, so "nothing ran" would be a true reading of an instant and a
+     * false answer about the flow.
+     *
+     * This is that same read, repeated under a bound, and it exists so nothing
+     * else has to poll. A caller that loops is a caller reaching the instance
+     * outside the registry; one read-only tool removes the reason to.
+     *
+     * IT NEVER CONVERTS TIME INTO A VERDICT. `settled`, `timed_out` and
+     * `found: false` come back as three separate facts and the caller decides
+     * what they mean. A run that timed out is not reported as a failure here,
+     * and an execution that errored is not reported as a timeout.
+     * ================================================================== */
+    name: 'wait_for_flow_execution',
+    description:
+      'Wait, up to a bounded timeout, for Flow Designer automation on a specific record to finish. '
+      + 'Polls the same execution history find_flow_executions reads and returns the last state seen, how '
+      + 'long it waited, and whether it SETTLED (reached COMPLETE/ERROR/CANCELLED/INTERRUPTED) or TIMED '
+      + 'OUT still running. A timeout is not a failure and "no execution" is not a failure: each is '
+      + 'reported as itself. Read-only.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string', description: 'The subject table the execution runs against.' },
+        sys_id: { type: 'string', description: 'The subject record sys_id.' },
+        flow_sys_id: {
+          type: 'string',
+          description: 'Optional. Count only executions of THIS flow; other automation on the same record is reported separately.',
+        },
+        timeout_ms: { type: 'number', description: 'Bound on the wait, in milliseconds. Clamped to the platform ceiling.' },
+        poll_ms: { type: 'number', description: 'Interval between reads, in milliseconds. Clamped to the floor.' },
+        limit: { type: 'number', description: 'Max executions to read per poll (platform ceiling 10).' },
+      },
+      required: ['table', 'sys_id'],
+    },
+    execute: (args) => waitForFlowExecution(args),
+    outputs: {
+      state: { type: 'string', from: 'state' },
+      found: { type: 'boolean', from: 'found' },
+      count: { type: 'number', from: 'count' },
+      execution_sys_id: { type: 'sys_id', path: ['executions', '0', 'sys_id'] },
+    },
+  },
+  {
+    name: 'get_record_audit',
+    description:
+      'The field-level change history of one record: which field changed, from what, to what, '
+      + 'by whom and when. ServiceNow only audits fields configured for auditing, so an empty '
+      + 'result means no AUDITED field changed - not that nothing changed. Read-only.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string' },
+        sys_id: { type: 'string' },
+        limit: { type: 'number', description: 'Max changes (platform ceiling 50).' },
+      },
+      required: ['table', 'sys_id'],
+    },
+    execute: (args) => auditFor(args),
+    outputs: { count: { type: 'number', from: 'count' } },
+  },
+  {
+    name: 'get_record_journal',
+    description:
+      'Journal entries (work notes, comments) written on one record, with author and time. '
+      + 'These are what PEOPLE wrote, not system state: a note saying "waiting for the network '
+      + 'team" is evidence that somebody believed that, never proof of an assignment. Read-only.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string' },
+        sys_id: { type: 'string' },
+        limit: { type: 'number', description: 'Max entries (platform ceiling 30).' },
+      },
+      required: ['sys_id'],
+    },
+    execute: (args) => journalFor(args),
+    outputs: { count: { type: 'number', from: 'count' } },
+  },
+  {
+    /*
+     * NAMED `get_record_slas`, not `get_task_slas`.
+     *
+     * A registry-wide guard (agent-tasks T12) forbids any tool whose NAME
+     * contains "task" or "step": those are NowForge's own control-plane words,
+     * and a tool appearing to touch them could rewrite the record of what the
+     * agent had done. ServiceNow's `task` is an unrelated concept that happens
+     * to share the word, and a name-level guard cannot tell them apart — so the
+     * tool is named for the record it reads. The guard keeps its full strength.
+     */
+    name: 'get_record_slas',
+    description:
+      'The runtime SLAs attached to a record (task_sla), with stage, breach flag and timings. '
+      + 'This is the live SLA clock, not the SLA definition. SLA state is never inferred from '
+      + 'priority. Read-only.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        record_sys_id: { type: 'string', description: 'The incident/record sys_id.' },
+        limit: { type: 'number', description: 'Max SLAs (platform ceiling 10).' },
+      },
+      required: ['record_sys_id'],
+    },
+    execute: ({ record_sys_id: recordSysId, limit }) => slasFor({ task_sys_id: recordSysId, limit }),
+    outputs: {
+      state: { type: 'string', from: 'state' },
+      count: { type: 'number', from: 'count' },
+      attached: { type: 'boolean', from: 'attached' },
+      /* The hop that makes the measured chain reachable: on this instance an
+       * incident has no flow executions of its own, but its task_sla rows do. */
+      sla_sys_id: { type: 'sys_id', path: ['slas', '0', 'sys_id'] },
+    },
+  },
+  {
+    name: 'get_ci_relationships',
+    description:
+      'The direct (one hop) relationships of a configuration item, upstream and downstream. '
+      + 'Not a CMDB graph traversal. Read-only.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sys_id: { type: 'string', description: 'The cmdb_ci sys_id.' },
+        limit: { type: 'number', description: 'Max relationships per direction (ceiling 25).' },
+      },
+      required: ['sys_id'],
+    },
+    execute: (args) => ciRelationshipsFor(args),
+    outputs: { count: { type: 'number', from: 'count' } },
+  },
+  {
+    name: 'delete_record',
+    description: 'Delete a record by sys_id. Destructive — requires user approval. Confirm intent with the user before calling.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: { table: { type: 'string' }, sys_id: { type: 'string' } },
+      required: ['table', 'sys_id'],
+    },
+    impersonable: true,
+    execute: async ({ table: t, sys_id }, ctx = {}) => {
+      const refusal = await refuseRecordWrite('delete_record', t);
+      if (refusal) return refusal;
+      return writeAsCurrentIdentity({
+        ctx, tool: 'delete_record', table: t, sysId: sys_id, operation: 'delete',
+        direct: () => table.remove(t, sys_id),
+      });
+    },
+    describeWrite: ({ table: t, sys_id }) => ({ table: t, operation: 'delete', requested: {}, sys_id }),
+  },
+  {
+    name: 'create_incident',
+    description:
+      'Convenience tool to create an incident. Resolve caller/assignment_group/assigned_to to sys_ids first via lookup_reference. Requires user approval.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        short_description: { type: 'string' },
+        description: { type: 'string' },
+        caller_id: { type: 'string', description: 'sys_id of a sys_user' },
+        assignment_group: { type: 'string', description: 'sys_id of a sys_user_group' },
+        assigned_to: { type: 'string', description: 'sys_id of a sys_user' },
+        urgency: { type: 'string', description: '1|2|3' },
+        impact: { type: 'string', description: '1|2|3' },
+        category: { type: 'string' },
+      },
+      required: ['short_description'],
+    },
+    execute: (input) => table.create('incident', input),
+    describeWrite: (input, result) => ({
+      table: 'incident', operation: 'insert', requested: input || {}, sys_id: cellValue(result?.sys_id),
+    }),
+  },
+  {
+    name: 'create_catalog_item',
+    description:
+      'Composite builder: create a catalog item WITH only the variables the user explicitly requested (and their choices) in one shot. Do not invent extra questions, approvals, fulfillment, categories, variable sets, scripts, user criteria, or flows. Every variable needs an explicit type code from the request/context: 1 Yes/No, 2 Multi Line Text, 3 Multiple Choice, 5 Select Box, 6 Single Line Text, 7 Checkbox, 8 Reference (set reference_table), 9 Date, 10 Date/Time, 21 List Collector (set reference_table), 18 Lookup Select Box / 22 Lookup Multiple Choice (set lookup_table — values come from that table, not from choices), 25 Masked, 26 Email. Requires user approval.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        short_description: { type: 'string' },
+        description: { type: 'string' },
+        category: { type: 'string', description: 'sys_id of sc_category (optional; resolve via lookup_reference on sc_category)' },
+        catalog: { type: 'string', description: 'sys_id of the sc_catalog to publish in (optional; the instance default catalog when omitted)' },
+        variables: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'internal name, snake_case' },
+              question_text: { type: 'string' },
+              type: { type: 'number', description: 'explicit ServiceNow variable type code; do not default when the request did not specify enough detail' },
+              mandatory: { type: 'boolean' },
+              reference_table: { type: 'string', description: 'for type 8 / 21' },
+              lookup_table: { type: 'string', description: 'for type 18 / 22 — the table the values come from' },
+              lookup_value: { type: 'string', description: 'for type 18 / 22 — the field stored as the value (default sys_id)' },
+              lookup_label: { type: 'string', description: 'for type 18 / 22 — the field(s) shown to the requester' },
+              choices: {
+                type: 'array',
+                items: { type: 'object', properties: { text: { type: 'string' }, value: { type: 'string' } } },
+              },
+            },
+            required: ['name', 'type'],
+          },
+        },
+      },
+      required: ['name', 'short_description'],
+    },
+    execute: (input) => catalog.createCatalogItemComposite(input),
+    describeWrite: (input, result) => ({
+      table: 'sc_cat_item', operation: 'insert', sys_id: result?.item?.sys_id,
+      /*
+       * PHASE 20 — this tool is COMPOSITE: its result is `{ item, variables }`,
+       * not a record. Naming the record lets the read-back verifier diff the
+       * fields that were requested against the row that was written; without it
+       * every catalog item verified as a silent no-op.
+       */
+      record: result?.item?.record ?? null,
+      // Only the item's own fields — `variables` is a child collection, and
+      // diffing it against the item record would report every one as dropped.
+      requested: {
+        name: input?.name, short_description: input?.short_description,
+        ...(input?.description ? { description: input.description } : {}),
+        ...(input?.category ? { category: input.category } : {}),
+      },
+    }),
+  },
+  {
+    name: 'create_record_producer',
+    description: 'Create a record producer targeting a table (resolve exact table name with lookup_table first). Requires user approval.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        table_name: { type: 'string' },
+        short_description: { type: 'string' },
+        script: { type: 'string' },
+      },
+      required: ['name', 'table_name'],
+    },
+    execute: (input) => catalog.createRecordProducer(input),
+    describeWrite: (input, result) => ({
+      table: 'sc_cat_item_producer', operation: 'insert', sys_id: cellValue(result?.sys_id),
+      requested: {
+        name: input?.name, table_name: input?.table_name,
+        ...(input?.short_description ? { short_description: input.short_description } : {}),
+        ...(input?.script ? { script: input.script } : {}),
+      },
+    }),
+  },
+  {
+    name: 'list_flows',
+    description: 'List Flow Designer flows on the instance (name, active, status, scope).',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { search: { type: 'string' }, active_only: { type: 'boolean' } },
+      required: [],
+    },
+    execute: ({ search, active_only }) => flows.list({ search, activeOnly: active_only }),
+  },
+  {
+    name: 'get_flow',
+    description: 'Read one flow top-to-bottom: header, trigger instances, ordered action instances, and flow logic blocks.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { sys_id: { type: 'string' } },
+      required: ['sys_id'],
+    },
+    execute: ({ sys_id }) => flows.detail(sys_id),
+  },
+  {
+    name: 'design_flow_blueprint',
+    description:
+      'DESIGN STEP. Turn a plain-language automation request into a precise flow blueprint: trigger, exact actions, configs, reference fields, and a test plan. Use this to think through and show the design before building. To actually build it on the instance, pass the blueprint to create_flow_live.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { description: { type: 'string' } },
+      required: ['description'],
+    },
+    execute: ({ description }, ctx = {}) => {
+      const refusal = requestContractRefusal('design_flow_blueprint', { description }, ctx);
+      if (refusal) return refusal;
+      return designFlowBlueprint(description);
+    },
+  },
+  {
+    name: 'flow_authoring_capability',
+    description:
+      'Check whether live Flow Designer authoring is available: ServiceNow SDK present, credentials stored, workspace healthy. Call this before promising to build a real flow. If ok is false, flow authoring is unavailable in this environment: report that, quote the returned fixes[] as the exact next action, and stop — nothing is substituted for a flow (no Business Rule, no script, no REST write to sys_hub_*).',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { deep: { type: 'boolean', description: 'Also run an authenticated probe against the instance (slower, ~8s)' } },
+      required: [],
+    },
+    execute: ({ deep }) => capability({ deep: Boolean(deep) }),
+  },
+  {
+    name: 'create_flow_live',
+    description:
+      'BUILD STEP. Create or UPDATE a REAL, active Flow Designer flow on the instance from a plain-language description or a blueprint from design_flow_blueprint. Generates Fluent TypeScript, compiles it offline (nothing reaches the instance unless it compiles), installs it, and reads the result back. Returns the flow name, sys_id, type and link. Requires user approval. Note: installing deploys the whole managed application, so the response lists every artifact shipped. ' +
+      'TO CHANGE AN EXISTING FLOW — adding a step, a condition, a branch — pass its EXACT current name as `updates`, and describe the flow as it should be when finished. Editing in place keeps the same sys_id. Creating a second flow instead collides with the first on its element keys and fails. Use list_live_flows to get the exact name. ' +
+      'TO BUILD A REUSABLE SUBFLOW — the request says "create a subflow", or describes a callable unit with named inputs and no trigger — pass artifact_type: "subflow" and state its inputs and outputs in the description. A subflow has no trigger; it is invoked by other flows. ' +
+      'BEFORE BUILDING A FLOW, call list_live_flows: if a managed subflow already does part of the work, describe the flow as CALLING it by name. Generating a second subflow with the same inputs is rejected before the build.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        description: { type: 'string', description: 'Plain-language automation request, describing the finished flow' },
+        blueprint: { type: 'object', description: 'A blueprint object previously returned by design_flow_blueprint' },
+        updates: {
+          type: 'string',
+          description:
+            'Exact name of an existing managed flow or subflow to edit IN PLACE, keeping its sys_id. Omit when creating something new.',
+        },
+        artifact_type: {
+          type: 'string',
+          enum: ['flow', 'subflow'],
+          description:
+            'What to build. "flow" (default) has exactly one trigger. "subflow" is a reusable callable unit with typed inputs and outputs and NO trigger — use it when the request asks for a subflow, or for something other flows will call. On an edit this is ignored: an artifact cannot change kind.',
+        },
+      },
+      required: [],
+    },
+    execute: async ({ description, blueprint, updates, artifact_type: artifactType }, ctx = {}) => {
+      const refusal = requestContractRefusal('create_flow_live', { description, blueprint, updates, artifact_type: artifactType }, ctx);
+      if (refusal) return refusal;
+      /*
+       * WI-4 — AN APPROVED BLUEPRINT IS NOT AN ALTERNATIVE TO A DESCRIPTION.
+       *
+       * This read `description || blueprint`, so whenever BOTH were supplied —
+       * which is exactly what happens after `design_flow_blueprint` produces a
+       * blueprint a human then approves — the blueprint was silently discarded
+       * and the generator worked from prose alone.
+       *
+       * MEASURED: the approved blueprint asked for the work note
+       * "Priority checked by onboarding subflow"; the installed source carries
+       * "Priority check performed." The name and the input type drifted too.
+       * Nothing downstream could catch it, because the approved artifact never
+       * reached any layer that could compare against it.
+       *
+       * Both now reach the generator, blueprint first because it is the thing
+       * that was approved, and the blueprint travels on as STRUCTURE as well as
+       * text so the pre-build gate can assert the source honours it.
+       */
+      const parts = [];
+      if (blueprint) parts.push(`APPROVED BLUEPRINT (authoritative — reproduce its name, inputs and every literal exactly):
+${JSON.stringify(blueprint, null, 1)}`);
+      if (description) parts.push(blueprint ? `ADDITIONAL CONTEXT FROM THE REQUEST:
+${description}` : description);
+      const spec = parts.join('\n\n');
+      if (!spec) throw new Error('Provide either description or blueprint.');
+      return createLiveFlow(spec, () => {}, {
+        updates: updates || null,
+        artifactType: artifactType || null,
+        blueprint: blueprint || null,
+      });
+    },
+    /*
+     * SESSION 1 / WI-6 — THE SDK TOOL JOINS THE TWO CONTRACTS.
+     *
+     * `describeWrite` aims the mutation pipeline at the artifact this tool
+     * produces: `sys_hub_flow`, THROUGH THE SDK (so the REST policy lets it
+     * pass), keyed by the read-back sys_id once there is one. It asks for the
+     * three things a person asked for — the workspace's scope, `active`, and
+     * `published` — and hands the verifier the read-back header, with
+     * `published` derived from the three-way proof rather than from `active`.
+     * A draft install therefore reads back as a FAILED write naming `active`
+     * and `published`, never as self-verified.
+     *
+     * Before execution there is no sys_id and nothing is invented: enough for
+     * the gate to know the table and the mechanism, no more.
+     */
+    describeWrite: ({ updates }, result) => {
+      const v = result?.verified ?? null;
+      const operation = updates ? 'update' : 'insert';
+      if (!v) return { table: 'sys_hub_flow', mechanism: 'sdk', operation, requested: { active: 'true', published: 'true' } };
+      const requested = { active: 'true' };
+      if (v.name ?? result?.name) requested.name = v.name ?? result.name;
+      if (v.expectedScopeId) requested.sys_scope = v.expectedScopeId;
+      const record = { ...(v.header ?? {}) };
+      /*
+       * `published` is asked for only when the proof could be READ. An
+       * unreadable snapshot row (published === null) is unknown, and asking the
+       * differ to compare "true" against an absence would report a drop that
+       * nobody measured; the tool result still carries `published: null` and
+       * the mismatch name, so the evidence says "unknown" in those words.
+       */
+      if (v.published !== null && v.published !== undefined) {
+        requested.published = 'true';
+        record.published = v.published === true ? 'true' : 'false';
+      }
+      return {
+        table: 'sys_hub_flow',
+        mechanism: 'sdk',
+        operation,
+        sys_id: v.sys_id,
+        requested,
+        record,
+      };
+    },
+    /*
+     * Declared outputs, read from the read-back — never from the request. A
+     * later step can now `$ref` the flow this one created: its identity, the
+     * table it lives in, the name the instance stored, and the scope.
+     */
+    outputs: {
+      sys_id: { type: 'sys_id', path: ['verified', 'sys_id'] },
+      table: { type: 'table_name', path: ['verified', 'table'] },
+      name: { type: 'string', path: ['verified', 'name'] },
+      scope: { type: 'string', path: ['verified', 'scope'] },
+    },
+  },
+  {
+    /*
+     * SESSION 2 / W1a — PUBLISHING A FLOW, AS ITS OWN SANCTIONED STEP.
+     *
+     * Installing an artifact and publishing it are two different acts, and
+     * until now only the first was reachable. The SDK publishes as a
+     * post-install task that runs only after its fixed 300-second deployment
+     * wait succeeds — which failed on six of our installs — and that swallows
+     * its own errors at debug level when it does run. Result, measured: 33
+     * flows on the instance, none published, and an agent whose only reachable
+     * route to "make it live" was a raw header write the policy refuses.
+     *
+     * This is that missing verb. It publishes ONE named artifact through the
+     * platform's own activation processor and proves the outcome by reading
+     * the header, its snapshot row and `active` back together.
+     */
+    name: 'activate_flow',
+    description:
+      'PUBLISH STEP. Make an installed flow or subflow live on the instance. Installing an artifact does NOT publish it: '
+      + 'a newly installed flow is a draft that will never run, and this is the step that publishes it. '
+      + 'Takes the exact artifact name (from create_flow_live, or from list_live_flows). '
+      + 'It asks the platform to publish that one artifact and then proves the result by reading back three things that must '
+      + 'agree — the header names a snapshot, that snapshot is published, and the header is active. It reports published: true '
+      + 'ONLY when all three agree, and otherwise names which one is missing. '
+      + 'A flow that calls a subflow needs BOTH published: publish the subflow first, then the flow. '
+      + 'Requires user approval. Never set a flow active with update_record — that writes a header with nothing to run, and is refused.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Exact name of the installed flow or subflow to publish, e.g. "Onboarding Priority Check Flow"' },
+      },
+      required: ['name'],
+    },
+    execute: async ({ name }) => {
+      const result = await activateManagedFlow(name);
+      /*
+       * Publishing is not expressible in the SDK source model, so the NEXT
+       * install — of this flow or of anything else in the app — re-applies the
+       * application from source and returns this header to draft. Recording the
+       * intent here is what makes a publish survive a later deploy: the
+       * post-install reconciler re-applies it and reads it back
+       * (post-install-state.js, kind `flow_published`).
+       *
+       * Recorded only on a PROVEN publish. An intent filed off a failed
+       * activation would have the reconciler publishing, later and unattended,
+       * something this call could not publish now.
+       */
+      if (result.ok) {
+        try {
+          recordIntendedState({ kind: 'flow_published', target: result.name, value: true, why: 'published through activate_flow' });
+        } catch (err) {
+          result.intentWarning = `Published, but the intent could not be recorded (${err.message}), so the next install will `
+            + 'revert this flow to draft without saying so.';
+        }
+      }
+      return result;
+    },
+    /*
+     * The write is a publish: the platform sets `active` and points the header
+     * at a snapshot. `mechanism: 'sdk'` because this is the SDK's own
+     * activation processor — the REST policy that refuses `sys_hub_*` writes is
+     * about the Table API, and this is not one.
+     */
+    describeWrite: ({ name }, result) => {
+      if (!result?.sys_id) {
+        return { table: 'sys_hub_flow', mechanism: 'sdk', operation: 'update', requested: { active: 'true', published: 'true' }, name };
+      }
+      const requested = { active: 'true' };
+      const record = { ...(result.header ?? {}) };
+      // `published` is asked for only when the proof could be READ; an
+      // unreadable snapshot is UNKNOWN, and asking the differ to compare
+      // against an absence would invent a drop nobody measured.
+      if (result.published !== null && result.published !== undefined) {
+        requested.published = 'true';
+        record.published = result.published === true ? 'true' : 'false';
+      }
+      return { table: 'sys_hub_flow', mechanism: 'sdk', operation: 'update', sys_id: result.sys_id, requested, record };
+    },
+    outputs: {
+      sys_id: { type: 'sys_id', from: 'sys_id' },
+      table: { type: 'table_name', from: 'table' },
+      name: { type: 'string', from: 'name' },
+    },
+  },
+  {
+    name: 'list_live_flows',
+    description:
+      'List the flows and subflows NowHelpAssist manages as Fluent source, with their current state on the instance. ' +
+      'Each subflow carries its I/O CONTRACT (input and output names, types and reference tables) and each artifact carries ' +
+      'its dependency edges: `calls` and `calledBy`. Read this BEFORE building a flow — if a subflow already does part of ' +
+      'the work, the new flow should call it rather than re-implement it — and before deleting anything, because a subflow ' +
+      'with callers cannot be removed.',
+    mutating: false,
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    execute: () => listManaged(),
+  },
+  {
+    name: 'delete_live_flow',
+    description:
+      'Delete a NowHelpAssist-managed flow or subflow by name: removes its Fluent source, reinstalls, and confirms it is gone from the instance. Destructive — confirm with the user in conversation first. Requires user approval. ' +
+      'A subflow that a managed flow still calls is REFUSED, with the callers named: delete or edit those callers first, then remove the subflow.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'Exact flow/subflow name' } },
+      required: ['name'],
+    },
+    execute: ({ name }) => removeManaged(name),
+  },
+  {
+    name: 'verify_flow_live',
+    description:
+      'SEMANTIC VERIFICATION. Prove a deployed artifact actually does what was asked, then delete the test data. ' +
+      'A record-triggered FLOW is fired by creating a record that matches its trigger. A SUBFLOW has no trigger, so it is CALLED: ' +
+      'a one-shot scheduled job invokes it through sn_fd.FlowAPI with the test inputs in its spec, and both its effects on records and ' +
+      'the values it RETURNS are asserted. Compiling only proves an artifact is well-formed — this proves it is correct. ' +
+      'Writes real records, so it needs its own approval and never runs automatically after a deploy.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'Exact flow name as deployed' } },
+      required: ['name'],
+    },
+    execute: ({ name }) => verify(name),
+  },
+  {
+    name: 'smoke_test_flow',
+    description:
+      'Optionally verify a deployed record-triggered flow by creating a test record that matches its trigger, waiting for a sys_flow_context execution, then deleting the test record. This writes real data, is NEVER part of a deploy, and needs its own approval. Resolve any reference values to sys_ids with lookup_reference first.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string', description: 'Table to create the test record on, e.g. incident' },
+        values: { type: 'object', description: 'Field values chosen to satisfy the flow trigger condition' },
+        wait_ms: { type: 'number', description: 'How long to wait for an execution (default 45000)' },
+      },
+      required: ['table', 'values'],
+    },
+    execute: ({ table: t, values, wait_ms }) => smokeRun({ table: t, values, waitMs: wait_ms || 45000 }),
+  },
+  {
+    name: 'get_catalog_item',
+    description:
+      'Read a catalog item top to bottom: its variables in order (with type, mandatory flag, help text, default, and the REAL choice values for choice-type variables), plus every UI policy scoped to it. Call this before proposing any change to an item — variable sys_ids and choice VALUES are what conditions and actions are built from, and neither can be guessed.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { sys_id: { type: 'string', description: 'sys_id of the sc_cat_item (resolve the name with lookup_reference on sc_cat_item)' } },
+      required: ['sys_id'],
+    },
+    execute: async ({ sys_id }) => {
+      const [item, policies] = await Promise.all([catalog.getItemDeep(sys_id), listPoliciesForItem(sys_id)]);
+      return {
+        item: { sys_id, name: item.item?.name?.display_value ?? item.item?.name, active: item.item?.active?.value },
+        variables: policies.variables,
+        variableSets: item.variableSets?.map((s) => ({ title: s.title?.display_value ?? s.title, variables: (s._variables || []).length })) || [],
+        policies: policies.policies,
+      };
+    },
+  },
+  {
+    name: 'add_catalog_variable',
+    description:
+      'Add one variable to an EXISTING catalog item. For a choice type (3 Multiple Choice, 5 Select Box) pass choices — a choice with no value cannot be referenced by a UI policy condition. A lookup type (18 Lookup Select Box, 22 Lookup Multiple Choice) takes lookup_table (and optionally lookup_value, lookup_label) instead of choices. Call get_catalog_item first so the order does not collide. Requires user approval.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cat_item: { type: 'string', description: 'sys_id of the catalog item' },
+        name: { type: 'string', description: 'internal name, snake_case' },
+        question_text: { type: 'string' },
+        type: { type: 'number', description: 'variable type code — read the real list from the catalog meta rather than assuming' },
+        mandatory: { type: 'boolean' },
+        order: { type: 'number' },
+        help_text: { type: 'string' },
+        default_value: { type: 'string' },
+        reference_table: { type: 'string', description: 'for type 8 (Reference) / 21 (List Collector)' },
+        lookup_table: { type: 'string', description: 'for type 18 / 22 — the table the values come from' },
+        lookup_value: { type: 'string', description: 'for type 18 / 22 — the field stored as the value (default sys_id)' },
+        lookup_label: { type: 'string', description: 'for type 18 / 22 — the field(s) shown to the requester' },
+        choices: {
+          type: 'array',
+          items: { type: 'object', properties: { text: { type: 'string' }, value: { type: 'string' } } },
+        },
+      },
+      required: ['cat_item', 'name', 'type'],
+    },
+    execute: ({ cat_item, ...v }) => catalog.createVariable({ cat_item }, v),
+    describeWrite: ({ cat_item, ...v }, result) => {
+      /* The row that was SENT, minus the parent link — `choices` are child
+         question_choice rows, not fields, and `reference_table` is stored as
+         `reference` / `list_table`. The result is `{ variable, choices }`, so
+         the record is named for the verifier rather than diffed as a wrapper. */
+      const { cat_item: _parent, ...requested } = variablePayload({ cat_item }, v || {});
+      return {
+        table: 'item_option_new', operation: 'insert',
+        requested, sys_id: cellValue(result?.variable?.sys_id),
+        record: result?.variable ?? null,
+      };
+    },
+  },
+  {
+    name: 'update_catalog_variable',
+    description:
+      'Update one variable in place: question_text, order, mandatory, help_text, default_value. Use this rather than deleting and recreating — a recreated variable gets a NEW sys_id, and every UI policy condition and action that names the old one silently stops matching. Requires user approval.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sys_id: { type: 'string', description: 'sys_id of the item_option_new record' },
+        question_text: { type: 'string' },
+        order: { type: 'number' },
+        mandatory: { type: 'boolean' },
+        help_text: { type: 'string' },
+        default_value: { type: 'string' },
+      },
+      required: ['sys_id'],
+    },
+    execute: async ({ sys_id, ...patch }) => {
+      const data = {};
+      for (const [k, v] of Object.entries(patch)) {
+        if (v === undefined) continue;
+        data[k] = typeof v === 'boolean' ? String(v) : String(v);
+      }
+      if (!Object.keys(data).length) throw new Error('Nothing to update — pass at least one field.');
+      const before = await table.get('item_option_new', sys_id);
+      await catalog.updateVariable(sys_id, data);
+      const after = await table.get('item_option_new', sys_id);
+      // Read-back, because a write to a field that does not exist is accepted
+      // and discarded rather than refused.
+      const mismatches = Object.entries(data)
+        .map(([f, want]) => ({ field: f, sent: want, stored: after?.[f]?.value ?? after?.[f] }))
+        .filter((m) => String(m.stored) !== String(m.sent));
+      return {
+        ok: mismatches.length === 0,
+        sys_id,
+        name: after?.name?.value ?? after?.name,
+        changed: Object.fromEntries(Object.keys(data).map((f) => [f, {
+          from: before?.[f]?.value ?? before?.[f], to: after?.[f]?.value ?? after?.[f],
+        }])),
+        mismatches,
+      };
+    },
+  },
+  {
+    name: 'list_ui_policies',
+    description:
+      'List the catalog UI policies scoped to one item, with their conditions decoded into readable form (which variable, which operator, which value) and their actions. Also reports problems NowHelpAssist can see without running the form: a condition on a variable that is not on the item, a value the variable cannot hold, or an action that leaves everything on "ignore" and therefore does nothing.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { cat_item: { type: 'string', description: 'sys_id of the catalog item' } },
+      required: ['cat_item'],
+    },
+    execute: ({ cat_item }) => listPoliciesForItem(cat_item),
+  },
+  {
+    name: 'create_ui_policy',
+    description:
+      'Create a catalog UI policy that shows, hides, requires or freezes a variable in response to another variable. Conditions and actions both address variables by their item_option_new sys_id, which you must read with get_catalog_item first — a condition naming anything else can never be satisfied, and NowHelpAssist refuses it rather than writing a policy that saves and does nothing. Choice values are checked against the variable real choices for the same reason. IMPORTANT: this compiles and installs through the ServiceNow SDK and takes about a minute, because catalog_ui_policy_action cannot be written over REST at all — a POST returns 201 and silently discards the fields that attach the action to its policy. Requires user approval.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        catalog_item: { type: 'string', description: 'sys_id of the catalog item' },
+        short_description: { type: 'string', description: 'The policy name, e.g. "Require justification for permanent access"' },
+        conditions: {
+          type: 'array',
+          description: 'WHEN. Every entry names a variable by sys_id.',
+          items: {
+            type: 'object',
+            properties: {
+              variable: { type: 'string', description: 'item_option_new sys_id of the variable being tested' },
+              operator: { type: 'string', description: 'One of: =, !=, IN, NOT IN, ISEMPTY, ISNOTEMPTY, LIKE, STARTSWITH' },
+              value: { type: 'string', description: 'For a choice variable this must be the choice VALUE, not its display text' },
+              join: { type: 'string', description: 'AND (default) | OR' },
+            },
+            required: ['variable', 'operator'],
+          },
+        },
+        actions: {
+          type: 'array',
+          description: 'THEN. Each state is the string "true", "false" or "ignore" — "ignore" means leave alone, and an action left entirely on ignore does nothing.',
+          items: {
+            type: 'object',
+            properties: {
+              variable: { type: 'string', description: 'item_option_new sys_id of the variable being changed' },
+              visible: { type: 'string', description: 'true | false | ignore' },
+              mandatory: { type: 'string', description: 'true | false | ignore' },
+              disabled: { type: 'string', description: 'true | false | ignore — "disabled" is read-only' },
+            },
+            required: ['variable'],
+          },
+        },
+        reverse_if_false: { type: 'boolean', description: 'Put the variables back when the condition stops being true. Default true, and almost always what "only when" means.' },
+        active: { type: 'boolean' },
+        order: { type: 'number' },
+      },
+      required: ['catalog_item', 'short_description', 'conditions', 'actions'],
+    },
+    execute: (input) => createPolicy(input),
+    /*
+     * An SDK install, so a descriptor with `mechanism: 'sdk'`: a refusal before
+     * the install (validate, build, binding) is recorded as not attempted, and a
+     * failure at or after it as unverified — never silently dropped from the
+     * ledger, which is what happened with no descriptor at all.
+     */
+    describeWrite: (input, result) => {
+      const requested = { short_description: String(input?.short_description ?? '').trim(), catalog_item: input?.catalog_item };
+      if (!result?.sys_id) return { table: 'catalog_ui_policy', mechanism: 'sdk', operation: 'insert', requested };
+      return {
+        table: 'catalog_ui_policy', mechanism: 'sdk', operation: 'insert', sys_id: result.sys_id, requested,
+        record: { short_description: result.policy?.short_description ?? '', catalog_item: result.policy?.catalog_item ?? '' },
+      };
+    },
+  },
+  {
+    name: 'list_slas',
+    description:
+      'List SLA definitions (contract_sla) on the instance: name, table, duration (decoded to seconds and a human form), schedule, and the start/stop/pause conditions. Read-only.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        search: { type: 'string', description: 'Match on name' },
+        table: { type: 'string', description: 'Restrict to SLAs that run on this table, e.g. incident' },
+        active_only: { type: 'boolean' },
+      },
+      required: [],
+    },
+    execute: ({ search, table: t, active_only }) => listSlas({ search, collection: t, activeOnly: active_only }),
+  },
+  {
+    name: 'get_sla',
+    description: 'Read one SLA definition top to bottom by name or sys_id, including whether its schedule is actually in effect.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'Exact name, or a sys_id' } },
+      required: ['name'],
+    },
+    execute: ({ name }) =>
+      (/^[0-9a-f]{32}$/i.test(name)
+        ? getSla(name)
+        : listSlas({ search: name }).then((r) => r.find((x) => x.name === name) || r[0] || null)),
+  },
+  {
+    name: 'sla_meta',
+    description: 'Choice values, schedules and relative-duration types available for building an SLA definition on this instance. Call before create_sla so every value is real.',
+    mutating: false,
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    execute: () => slaMeta(),
+  },
+  {
+    name: 'create_sla',
+    description:
+      'Create an SLA definition (contract_sla) on the instance. Every condition is checked field-by-field against the target table BEFORE anything is written — a start condition naming a field that does not exist is not an error on this platform, it is a WIDER condition, and the SLA then attaches to every record on the table. duration accepts "4h", "90m", "2d 4h", "4:00:00" or seconds. A schedule is only honoured when schedule_source is "sla_definition". Requires user approval.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        collection: { type: 'string', description: 'Table the SLA runs on, e.g. incident' },
+        duration: { type: 'string', description: '"4h", "90m", "2d 4h", "4:00:00", or a number of seconds' },
+        start_condition: { type: 'string', description: 'Encoded query on the target table. Required.' },
+        stop_condition: { type: 'string', description: 'Encoded query on the target table' },
+        pause_condition: { type: 'string', description: 'Encoded query on the target table' },
+        type: { type: 'string', description: 'SLA | OLA | Underpinning contract' },
+        target: { type: 'string', description: 'response | resolution' },
+        schedule: { type: 'string', description: 'sys_id of a cmn_schedule (resolve with lookup_reference on cmn_schedule)' },
+        schedule_source: { type: 'string', description: 'no_schedule | sla_definition | task_field. A schedule is IGNORED unless this is sla_definition.' },
+        duration_type: { type: 'string', description: 'sys_id of a cmn_relative_duration, INSTEAD of a fixed duration' },
+        timezone_source: { type: 'string' },
+        retroactive: { type: 'boolean' },
+        when_to_cancel: { type: 'string' },
+        active: { type: 'boolean' },
+      },
+      required: ['name', 'collection', 'start_condition'],
+    },
+    execute: (input) => createSla(input),
+  },
+  {
+    name: 'verify_sla_live',
+    description:
+      "SEMANTIC VERIFICATION for an SLA. Derives a record from the definition's OWN start condition (driving calculated fields through their inputs), creates it, confirms the platform agrees it matches, then asserts that a task_sla attached REFERENCING THIS DEFINITION with a planned_end of start + duration inside a stated tolerance — and deletes the record again, reading back to prove it is gone. Note that other SLAs on the instance attach to the same record, so \"an SLA attached\" is not the assertion; \"this one attached\" is. Writes real records, so it needs its own approval.",
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Exact SLA definition name, or a sys_id' },
+        tolerance_sec: { type: 'number', description: 'Allowed drift on planned_end (default 120)' },
+      },
+      required: ['name'],
+    },
+    execute: ({ name, tolerance_sec }) => verifySla(name, () => {}, { toleranceSec: tolerance_sec || undefined }),
+  },
+  {
+    name: 'acl_report',
+    description:
+      'Read the access control rules for a table: record and field ACLs across the whole inheritance chain, with operation, roles, condition, active flag, admin_overrides, and whether a script guards the rule. Read-only, and it never authors an ACL. If the ACL tables are not readable on this connection the report says so — an empty result is a visibility answer, not "this table has no ACLs".',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string' },
+        inherited: { type: 'boolean', description: 'Include ACLs defined on parent tables (default true)' },
+      },
+      required: ['table'],
+    },
+    execute: ({ table: t, inherited }) => aclReport(t, { includeInherited: inherited !== false }),
+  },
+  {
+    name: 'acl_diff',
+    description:
+      'Compare two roles against one table: which ACL rows name each, per operation, plus field-level differences. This is a diff of what the rules SAY, not a simulation of the decision engine — the response carries that caveat and you must pass it on rather than telling the user what a role "can do".',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string' },
+        role_a: { type: 'string', description: 'e.g. admin' },
+        role_b: { type: 'string', description: 'e.g. itil' },
+      },
+      required: ['table', 'role_a', 'role_b'],
+    },
+    execute: ({ table: t, role_a, role_b }) => aclDiff(t, role_a, role_b),
+  },
+  {
+    name: 'explain_acls',
+    description:
+      'Turn the structured ACL report for a table into a plain-language summary. The summary is GENERATED and the response labels it as such; the report it describes is read off the instance. Read-only.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { table: { type: 'string' } },
+      required: ['table'],
+    },
+    execute: async ({ table: t }) => explainAclReport(await aclReport(t)),
+  },
+
+  /* ---------------------------------------------------------------- *
+   * WI-ACL-1 — ACL AUTHORING. Model-callable, but never model-executed.
+   *
+   * These three tools are the ONLY ACL write verbs, and none of them writes
+   * anything. Their `execute` is unreachable: `describeWrite` produces a
+   * `(sys_security_acl, create|update|delete)` descriptor, `isGatedDescriptor`
+   * classifies it as gated, and `handleGatedElevation` intercepts the call
+   * before `executeTool` is ever reached (orchestrator.js). The actual write
+   * happens inside one elevated execution, as an atomic ACL + role-link unit,
+   * after a human approves a card that names the rule in plain language.
+   *
+   * So the model can ASK for an ACL. It cannot author one, cannot elevate,
+   * cannot reach the shim, and cannot fall back to `create_record` — that route
+   * produces the same gated descriptor and lands in the same gate.
+   *
+   * The `execute` bodies exist only to make that unreachability LOUD rather
+   * than implicit: if the interception is ever removed or reordered, these
+   * throw instead of quietly performing an un-elevated write that would
+   * silently no-op and leave the user believing access had changed.
+   * ---------------------------------------------------------------- */
+  {
+    name: 'create_acl',
+    description:
+      'Author a NEW access control rule (ACL) on a GLOBAL table, together with the roles it requires, as one all-or-nothing '
+      + 'elevated change. Requires user approval and elevates security_admin. '
+      + 'The rule is refused BEFORE you are asked to approve it if it would be empty (no role, security attribute, condition '
+      + 'or script — the platform denies by default on those, so it would lock people out rather than error), if a role or '
+      + 'security attribute does not exist, if the script is trivially true, if a condition names a field the table does not '
+      + 'have (the platform silently drops such a clause, making the rule WIDER than it reads), or if it would break one of '
+      + "ServiceNow's scope restrictions. "
+      + "The rule is authored in the TARGET TABLE'S OWN application scope, derived automatically — a scoped table gets a "
+      + 'scoped rule, a global table a global one. '
+      + 'Call acl_report on the table first: an ACL is evaluated alongside every other matching rule, so you need to know what '
+      + 'is already there before adding one.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string', description: 'The table the rule governs, e.g. incident. Must be a global-scope table. Wildcards are refused.' },
+        field: { type: 'string', description: 'Optional. A field name for a field-level ACL, or "*" for every field. Omit for a record-level ACL.' },
+        operation: { type: 'string', description: 'read, write, create, delete, or any operation the instance defines (sys_security_operation).' },
+        decision_type: { type: 'string', description: '"allow" (Allow If — the default) or "deny" (Deny Unless).' },
+        type: { type: 'string', description: 'ACL type. Only "record" is proven live here; anything else is refused.' },
+        roles: { type: 'array', items: { type: 'string' }, description: 'Role NAMES this rule requires, e.g. ["itil"]. Resolved server-side; an unknown role is refused.' },
+        security_attributes: { type: 'array', items: { type: 'string' }, description: 'Security attribute name. This table holds ONE; asking for more is refused rather than truncated.' },
+        data_condition: { type: 'string', description: 'Encoded query the record must match, e.g. "state=1^assigned_toISNOTEMPTY". Fields are checked against the real schema.' },
+        script: { type: 'string', description: 'ACL script. A trivially-true script is refused — it looks like a condition and constrains nothing.' },
+        applies_to: { type: 'string', description: 'Optional case-sensitive record pre-filter (the Applies-to condition).' },
+        active: { type: 'boolean', description: 'Default true. An inactive ACL is stored but never evaluated.' },
+        admin_overrides: { type: 'boolean', description: 'Default false. When true, admin bypasses this rule.' },
+        description: { type: 'string', description: 'Why this rule exists. Worth writing — the platform generates one otherwise.' },
+        scope: {
+          type: 'string',
+          description:
+            'Rarely needed. The application scope to author the rule INTO, e.g. "global" or an app scope name. '
+            + "OMIT IT and the rule is authored in the target table's own scope, which is what ServiceNow requires "
+            + 'and what you almost always want. Naming a different scope is legal only when the target table carries '
+            + 'a field in that scope; anything else is refused.',
+        },
+      },
+      required: ['table', 'operation'],
+    },
+    execute: () => { throw unreachableAclWrite('create_acl'); },
+    describeWrite: (input) => ({
+      table: 'sys_security_acl',
+      operation: 'insert',
+      requested: aclDescriptorSummary(input),
+      sys_id: null,
+      acl_spec: input,
+    }),
+  },
+  {
+    name: 'update_acl',
+    description:
+      'Change an existing ACL by sys_id — its condition, script, roles, active flag, decision type, applies-to filter or '
+      + 'description — together with its role links, as one all-or-nothing elevated change. Requires user approval and elevates '
+      + 'security_admin. '
+      + 'The patch is merged onto the rule AS IT IS ON THE INSTANCE and the RESULT is validated, so a change that would leave '
+      + 'the ACL empty (for example clearing its roles when the role was its only condition) is refused before you are asked to '
+      + 'approve it — an empty ACL denies everyone it matches. A patch that changes nothing is also refused. '
+      + 'It cannot repoint an ACL at a different table, field or operation: that is a different rule, and it is a delete plus a '
+      + 'create. Read the ACL with acl_report first and use the sys_id that read returns.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sys_id: { type: 'string', description: 'sys_id of the ACL to change, from acl_report.' },
+        roles: { type: 'array', items: { type: 'string' }, description: 'The COMPLETE role list this rule should require afterwards — it replaces the current set, it does not add to it.' },
+        security_attributes: { type: 'array', items: { type: 'string' } },
+        data_condition: { type: 'string', description: 'Encoded query. Pass "" to clear it.' },
+        script: { type: 'string', description: 'ACL script. Pass "" to clear it.' },
+        applies_to: { type: 'string' },
+        decision_type: { type: 'string', description: '"allow" or "deny".' },
+        active: { type: 'boolean' },
+        admin_overrides: { type: 'boolean' },
+        description: { type: 'string' },
+        scope: {
+          type: 'string',
+          description:
+            'Rarely needed. The application scope to author the rule INTO, e.g. "global" or an app scope name. '
+            + "OMIT IT and the rule is authored in the target table's own scope, which is what ServiceNow requires "
+            + 'and what you almost always want. Naming a different scope is legal only when the target table carries '
+            + 'a field in that scope; anything else is refused.',
+        },
+      },
+      required: ['sys_id'],
+    },
+    execute: () => { throw unreachableAclWrite('update_acl'); },
+    describeWrite: (input) => ({
+      table: 'sys_security_acl',
+      operation: 'update',
+      requested: aclDescriptorSummary(input),
+      sys_id: input?.sys_id ?? null,
+      acl_spec: input,
+    }),
+  },
+  {
+    name: 'delete_acl',
+    description:
+      'Delete an ACL and every role link on it, through the elevated channel. Destructive — confirm with the user in '
+      + 'conversation first, then call it; approval and elevation follow. '
+      + 'This is the ONLY correct way to remove an ACL: delete_record on sys_security_acl runs un-elevated, is denied, and '
+      + 'SILENTLY DOES NOTHING while appearing to succeed. Deleting a rule removes whatever access it granted, so read it with '
+      + 'acl_report first and tell the user what it does before removing it.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: { sys_id: { type: 'string', description: 'sys_id of the ACL to delete, from acl_report.' } },
+      required: ['sys_id'],
+    },
+    execute: () => { throw unreachableAclWrite('delete_acl'); },
+    describeWrite: (input) => ({
+      table: 'sys_security_acl',
+      operation: 'delete',
+      requested: {},
+      sys_id: input?.sys_id ?? null,
+      acl_spec: input,
+    }),
+  },
+  {
+    name: 'recall_memory',
+    description:
+      'Search every past conversation and the instance knowledge ledger. Use this whenever the user refers to earlier work — "what did we decide about vendor-hold incidents", "the flow we built last week", "that sys_id from before" — instead of guessing or saying you cannot know. Read-only. The response states which mode answered: "semantic" (embeddings) or "keyword" (the embedding model is not pulled), so report the mode if the results look thin.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'What to look for, in plain language' },
+        limit: { type: 'number', description: 'Max results (default 8)' },
+        session_id: { type: 'string', description: 'Restrict to one session; omit to search all of them' },
+      },
+      required: ['query'],
+    },
+    execute: ({ query, limit, session_id }) =>
+      search(query, { limit: Math.min(limit || 8, 25), sessionId: session_id || null }),
+  },
+  {
+    name: 'list_instance_facts',
+    description:
+      'Read the instance knowledge ledger: traps, measured facts about this instance, established decisions, and user preferences. These are already injected into your system prompt — call this only when you need the full list or a specific provenance.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { kind: { type: 'string', description: 'trap | mapping | decision | preference' } },
+      required: [],
+    },
+    execute: ({ kind }) => listFacts({ kind: kind || undefined }),
+  },
+  {
+    name: 'remember_fact',
+    description:
+      'Store something durable in the instance knowledge ledger, so future sessions start knowing it. Use for a measured fact about this instance, a decision the user made, or a preference they stated. Give provenance — how it was established. Not a mutation on the instance, but it does change future behaviour, so only record things you actually verified or the user actually said.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', description: 'trap | mapping | decision | preference' },
+        key: { type: 'string', description: 'Short kebab-case identifier, e.g. incident-problem-link-absent' },
+        value: { type: 'string', description: 'The fact itself, stated so a future session can act on it' },
+        provenance: { type: 'string', description: 'How this was established (a read-back, a failed verification, the user said so)' },
+      },
+      required: ['kind', 'key', 'value'],
+    },
+    execute: ({ kind, key, value, provenance }) => recordFact({ kind, key, value, provenance }),
+  },
+  /* ---------------------------------------------------------------- *
+   * K3 - knowledge. All five are READ-ONLY with respect to the
+   * instance: none can create, change or delete anything on
+   * ServiceNow, and none can reach an approval, the write guard or the
+   * elevation gate. That is deliberate, and it is the whole safety
+   * argument for adding retrieval - the knowledge layer informs the
+   * plan and has no way to authorise it.
+   * ---------------------------------------------------------------- */
+  {
+    name: 'search_servicenow_docs',
+    description:
+      'Search indexed OFFICIAL ServiceNow documentation - product docs, Glide/REST API reference, Flow Designer '
+      + 'and subflows, ACLs, scripts, SLAs, tables and fields, scoped applications, security, and release notes. '
+      + 'Use it when the request turns on how the PLATFORM behaves rather than on what is on this instance. '
+      + 'Read-only, and it CANNOT AUTHORISE ANYTHING: documentation informs your plan, it is never a substitute '
+      + 'for get_table_schema, a read-back, or a capability check, and "the docs say so" is never grounds for a '
+      + 'mutation. Prefers newer releases when two versions of the same page match, and tells you which signal '
+      + 'decided. The result states how many documents are indexed and whether the search ran semantically or '
+      + 'degraded to keyword matching - quote both if the results look thin. ZERO HITS MEANS NOTHING WAS FOUND, '
+      + 'never that the platform lacks the feature; if "indexed" is 0 the corpus is empty and no conclusion may '
+      + 'be drawn from it at all. Cite only the url the tool returns, never one you composed yourself.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'What to look up, in plain language' },
+        topic: { type: 'string', description: 'Restrict to one topic, e.g. flow-designer, acl, sla, glide-api' },
+        product: { type: 'string', description: 'Restrict to one product family' },
+        document_type: { type: 'string', description: 'documentation | api-reference | release-note | developer-guide | kb-article | store-listing' },
+        version: { type: 'string', description: 'Restrict to one release. Omit to let version preference pick the newest.' },
+        limit: { type: 'number', description: 'Max results (default 6)' },
+      },
+      required: ['query'],
+    },
+    execute: ({ query, topic, product, document_type, version, limit }) =>
+      searchKnowledge(query, {
+        limit: Math.min(limit || 6, 20),
+        filters: { topic, product, document_type, version },
+      }),
+  },
+  {
+    name: 'knowledge_status',
+    description:
+      'What ServiceNow documentation is actually indexed: how many documents, broken down by source and topic, '
+      + 'how many are embedded, and how many carry a release that is not in the configured release order (those '
+      + 'cannot be ranked newest-first). Call it when a documentation search comes back thin, so you can tell '
+      + '"the corpus does not cover this" from "the corpus is empty" - those look identical from a search result '
+      + 'and mean completely different things. Read-only.',
+    mutating: false,
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    execute: () => knowledgeStats(),
+  },
+  {
+    name: 'resolve_source_conflict',
+    description:
+      'Apply the source-precedence ladder when the sources disagree: live PDI state > actual tool/SDK capability '
+      + '> current official documentation > your own knowledge. Give it the competing claims; it says which wins '
+      + 'and what was overruled. Three parts of the result matter. A claim tagged live_pdi or tool_capability '
+      + 'with no evidence attached is DEMOTED to model knowledge, because an assertion about live state is not a '
+      + 'reading of it. A verdict of "stop_and_ask" - nothing evidenced, or two equally authoritative answers '
+      + 'that contradict - means you STOP and put the returned question to the user rather than picking one. And '
+      + 'when can_authorize is false, the winning claim may inform your plan but may NOT justify an action: '
+      + 'establish the state from the instance first. Read-only.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: 'The behaviour in dispute, stated as a question' },
+        claims: {
+          type: 'array',
+          description: 'The competing claims, one per source',
+          items: {
+            type: 'object',
+            properties: {
+              source: { type: 'string', description: AUTHORITY_ORDER.join(' | ') },
+              says: { type: 'string', description: 'What this source says the behaviour is' },
+              evidence: { type: 'string', description: 'REQUIRED for live_pdi and tool_capability: the read-back, tool result or capability output. Without it the claim is demoted to model knowledge.' },
+              ref: { type: 'string', description: 'Where it came from - a sys_id, a doc url, a tool name' },
+            },
+            required: ['source', 'says'],
+          },
+        },
+      },
+      required: ['question', 'claims'],
+    },
+    execute: ({ question, claims }) => resolveConflict({ question, claims }),
+  },
+  {
+    name: 'record_verified_observation',
+    description:
+      'Store something SNADA has MEASURED about the SDK, its own tools, or this platform - an SDK limitation you '
+      + 'hit, an approach that worked, an approach that failed, release-specific behaviour, a tooling defect. A '
+      + 'different store from remember_fact: that one is per-instance knowledge broadcast into every prompt, this '
+      + 'one is queried, and every row must carry the ARTIFACT that made it true. The evidence field is required '
+      + 'and must be the error text, the read-back or the compiler output ITSELF, not a description of it. NEVER '
+      + 'record a conclusion you reasoned to rather than observed - the only thing this store is worth is that '
+      + 'everything in it was measured, and one unmeasured row costs it that. Scope it to "*" only when it is a '
+      + 'property of the SDK or the platform rather than of this instance. Does not touch the instance.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        category: { type: 'string', description: OBSERVATION_CATEGORIES.join(' | ') },
+        subject: { type: 'string', description: 'What it is about - a tool name, a table, an SDK feature, an API' },
+        observation: { type: 'string', description: 'What was observed, in one sentence a future session can act on' },
+        evidence_kind: { type: 'string', description: EVIDENCE_KINDS.join(' | ') },
+        evidence: { type: 'string', description: 'The artifact itself: the error text, the read-back, the compiler output' },
+        instance: { type: 'string', description: '"*" for a property of the SDK or platform; omit for this instance' },
+        platform_version: { type: 'string', description: 'The release, when it was actually determined' },
+      },
+      required: ['category', 'subject', 'observation', 'evidence_kind', 'evidence'],
+    },
+    execute: ({ category, subject, observation, evidence_kind, evidence, instance, platform_version }) =>
+      recordObservation({
+        category, subject, observation,
+        evidenceKind: evidence_kind, evidence,
+        instance, platformVersion: platform_version,
+      }),
+  },
+  {
+    name: 'list_verified_observations',
+    description:
+      'Read what SNADA has verified for itself about the SDK, its tools and this platform. Call it BEFORE '
+      + 'attempting something that has been tried before - an SDK feature, a table operation, an authoring path - '
+      + 'because a recorded limitation is the difference between failing again and knowing not to try. Results '
+      + 'are scoped: universal observations plus ones measured on THIS instance, never ones measured elsewhere. '
+      + 'Read-only.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        subject: { type: 'string', description: 'Substring match on the subject' },
+        category: { type: 'string', description: OBSERVATION_CATEGORIES.join(' | ') },
+        limit: { type: 'number', description: 'Max results (default 25)' },
+      },
+      required: [],
+    },
+    execute: ({ subject, category, limit }) => ({
+      observations: listObservations({ subject, category, limit: Math.min(limit || 25, 100) }),
+      stats: observationStats(),
+    }),
+  },
+  {
+    name: 'list_applications',
+    description:
+      'List the application scopes on this instance: custom applications, store/plugin applications, and the global scope. '
+      + 'Each says whether NowHelpAssist manages it (an SDK workspace on disk claims that scope) and, if so, how many managed sources it holds. '
+      + 'Read-only. Use it to answer which scope an artifact belongs to, or which applications exist, instead of guessing a scope name. '
+      + 'Note that anything you create over the Table API is born in the GLOBAL scope — REST silently ignores sys_scope — so a scoped artifact has to go through the SDK flow tools.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        search: { type: 'string', description: 'Match on application name or scope name' },
+        kind: { type: 'string', description: 'custom | store | scope — omit for all' },
+        managed: { type: 'boolean', description: 'Only applications NowHelpAssist manages' },
+      },
+      required: [],
+    },
+    execute: async ({ search, kind, managed }) => {
+      const r = await listApplications({ search: search || '', kind: kind || '', managedOnly: managed === true, limit: 1000 });
+      // The full 743-row list would swamp the context and teach nothing. Store
+      // apps are summarised unless they were explicitly asked for.
+      const listed = kind === 'store' || search
+        ? r.applications.slice(0, 50)
+        : r.applications.filter((a) => a.kind !== 'store');
+      return {
+        counts: r.counts,
+        managedCount: r.managedCount,
+        visibility: r.visibility.note,
+        applications: listed.map((a) => ({
+          name: a.name, scope: a.scope, version: a.version, kind: a.kind,
+          managedByNowHelpAssist: a.managed, sources: a.workspace?.sourceCount ?? null,
+        })),
+        storeApplications: kind === 'store' || search ? undefined : `${r.counts.store || 0} store applications not listed — pass kind:"store" or a search term`,
+      };
+    },
+  },
+  {
+    name: 'create_application',
+    description:
+      'Establish the NowForge application on the bound instance through the SDK. There is exactly ONE application and its '
+      + 'scope is fixed by the workspace (x_<vendor>_nwforge, where the vendor prefix is issued by this instance): a name or '
+      + 'scope you pass is recorded as the request, never used to mint a second application. '
+      + 'If the application already exists on this instance the call is REFUSED with reason app_exists and nothing is written — '
+      + 'every flow, table and catalog artifact NowForge authors already lives in that application. '
+      + 'If it is absent, this installs the workspace to create it (a whole-application install, minutes not seconds) and reads '
+      + 'the sys_app row back. Requires user approval. Inserting into sys_scope or sys_app over REST is refused separately: it '
+      + 'produces a husk Studio will not list.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'What the user called the application. Recorded with the result; the scope stays the workspace scope.' },
+        description: { type: 'string' },
+      },
+      required: [],
+    },
+    execute: ({ name, description }) => createApplication({ name, description }),
+  },
+  {
+    name: 'check_scope_name',
+    description:
+      'Check what scope name a name would derive to on this instance, and whether a proposed one is legal, WITHOUT creating anything. '
+      + 'Read-only, and informational: create_application always uses the workspace\'s own fixed scope (x_<vendor>_nwforge) and never '
+      + 'mints a per-request one. The vendor prefix is issued by the instance and the 18-character limit is the platform\'s.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'The application name to derive a scope from' },
+        scope_name: { type: 'string', description: 'A proposed scope name to validate instead' },
+      },
+      required: [],
+    },
+    execute: async ({ name, scope_name: scopeName }) => {
+      const prefix = await vendorPrefix();
+      const suggested = name ? suggestScopeName(name, prefix) : null;
+      return {
+        vendorPrefix: prefix,
+        maxLength: MAX_SCOPE_LENGTH,
+        charactersAvailable: MAX_SCOPE_LENGTH - prefix.length,
+        ...(suggested ? { suggested } : {}),
+        ...(scopeName ? { check: validateScopeName(scopeName, prefix) } : {}),
+        manualAlternative: studioSteps(prefix),
+      };
+    },
+  },
+  {
+    name: 'list_captured_sets',
+    description:
+      'List the update sets NowHelpAssist has created on this instance to capture configuration changes, with how many updates each holds. '
+      + 'Pass a set sys_id to see exactly what is in one. Read-only. '
+      + 'Update sets carry CONFIGURATION only — never task data such as incidents or requests.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { set: { type: 'string', description: 'sys_id of one set, to list its contents' } },
+      required: [],
+    },
+    execute: async ({ set }) => (set ? setContents(set) : listCapturedSets({})),
+  },
+
+  /* ---------------------------------------------------------------- *
+   * Impersonation mode (B3)
+   *
+   * These do NOT open a ServiceNow session. Under M1 each execution
+   * impersonates and reverts inside one bounded job, so "mode" records which
+   * target the NEXT execution stamps. The descriptions say so, because a model
+   * that believes a session is open will reason wrongly about what ending does.
+   * ---------------------------------------------------------------- */
+  {
+    name: 'impersonation_start',
+    description:
+      'Begin acting as another user, so reads and writes are evaluated against THEIR permissions and attributed to them. '
+      + 'Requires user approval. Give a task descriptor saying what this is for — it is what lets NowHelpAssist notice later '
+      + 'that a request has wandered outside the original task instead of silently carrying another user\'s authority into '
+      + 'unrelated work. Eligibility is decided by NowHelpAssist against sys_user, not by the platform: canImpersonate() is '
+      + 'not consulted because it approves inactive users and sys_ids that match no record. If the target holds the admin '
+      + 'role this returns a refusal asking for elevated approval — tell the user plainly, and only call again with '
+      + 'elevated_approval after they explicitly confirm. Note that no persistent ServiceNow session is opened: each '
+      + 'execution impersonates and reverts inside one bounded job.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        user: { type: 'string', description: 'user_name, display name, or sys_id. A name matching more than one user is returned as a list to choose from, never picked for you.' },
+        task: { type: 'string', description: 'What this impersonation is for, in a phrase — e.g. "check what Aagamya can see on the Laptop Request item".' },
+        elevated_approval: {
+          type: 'boolean',
+          description: 'Only after the user has explicitly confirmed they want to impersonate an ADMINISTRATOR. Never set this on your own initiative; it appears on the approval card the user sees.',
+        },
+      },
+      required: ['user', 'task'],
+    },
+    execute: ({ user, task, elevated_approval }, { sessionId } = {}) =>
+      startImpersonation({ sessionId, user, task, elevatedApproval: elevated_approval }),
+  },
+  {
+    name: 'impersonation_switch',
+    description:
+      'Re-target impersonation to a different user. Same eligibility gate and approval as impersonation_start. '
+      + 'The real initiator is preserved — switching changes who is being impersonated, never who is doing it.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        user: { type: 'string', description: 'user_name, display name, or sys_id.' },
+        task: { type: 'string', description: 'Optional new task descriptor. Omit to keep the current one.' },
+        elevated_approval: { type: 'boolean', description: 'Only after explicit user confirmation for an ADMINISTRATOR target.' },
+      },
+      required: ['user'],
+    },
+    execute: ({ user, task, elevated_approval }, { sessionId } = {}) =>
+      switchImpersonation({ sessionId, user, task, elevatedApproval: elevated_approval }),
+  },
+  {
+    name: 'impersonation_end',
+    description:
+      'Stop acting as another user and return to the NowHelpAssist service identity. Not gated — stopping is always safe. '
+      + 'Verifies by reading gs.getUserID() off the instance rather than assuming.',
+    mutating: false,
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    execute: (_input, { sessionId } = {}) => endImpersonation({ sessionId }),
+  },
+  {
+    name: 'impersonation_status',
+    description:
+      'Report whether impersonation mode is active, who the target is, who the real initiator is, and the task it was '
+      + 'started for. Pass probe: true to additionally read the effective user off the instance. Read-only.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { probe: { type: 'boolean', description: 'Also read gs.getUserID() live. Costs one bounded execution (a few seconds).' } },
+      required: [],
+    },
+    execute: ({ probe }, { sessionId } = {}) => impersonationStatus({ sessionId, probe }),
+  },
+  {
+    name: 'impersonation_provenance',
+    description:
+      'Answer "who really did this" for a record changed while impersonation mode was active. The instance keeps NO '
+      + 'record of the real initiator behind an impersonated change - it stamps only the impersonated user - so this '
+      + 'NowHelpAssist ledger is the only place the answer exists. Pass a record sys_id to look one up, or omit it to '
+      + 'list what this session recorded. Read-only. Note the distinction it reports: a write that actually EXECUTED as '
+      + 'the impersonated user has an attribution gap; one that ran under the NowHelpAssist service identity while mode '
+      + 'happened to be active does not, and is attributed correctly by the instance.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sys_id: { type: 'string', description: 'The changed record sys_id to trace back to its real initiator.' },
+        target: { type: 'string', description: 'Instead: a user sys_id, to list everything that identity was used for.' },
+      },
+      required: [],
+    },
+    execute: ({ sys_id, target }, { sessionId } = {}) => {
+      if (sys_id) return whoReallyDid(sys_id);
+      if (target) return { target_sys_id: target, entries: impersonationAuditForTarget(target) };
+      return { session: sessionId, entries: impersonationAuditForSession(sessionId) };
+    },
+  },
+
+  /* ── Database Administration, Phase 0 — context and raw metadata ───────────
+   *
+   * Both are read-only. The DBA module's dependency order is fixed (Schema
+   * Intelligence -> Impact & Safety -> Authoring -> Data ops) and nothing that
+   * writes schema exists yet, deliberately.
+   */
+  {
+    name: 'dba_context',
+    description:
+      'Report what the CONNECTED instance can actually recover, before promising anything about a delete or a schema '
+      + 'change. Returns the database engine, the state of the Delete Recovery / Restore Deleted Records plugins, the '
+      + 'per-category rollback retention in days, the identity and roles NowHelpAssist holds, the application scope, '
+      + 'and the destructive-operation policy. '
+      + 'CALL THIS BEFORE telling a user whether anything is reversible. The recovery verdict is three-state on '
+      + 'purpose: "full", "partial" and "none" are different answers and rounding "partial" to either one is a lie. '
+      + 'If the engine reports unknown, treat every delete as irreversible — never fill it in from memory.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        refresh: { type: 'boolean', description: 'Re-measure instead of using the cached context.' },
+        probe_engine: {
+          type: 'boolean',
+          description: 'Default true. Engine detection costs one server-side script execution (~2s) because '
+                     + 'glide.db.rdbms has no sys_properties row and is only readable via gs.getProperty. Pass false '
+                     + 'to skip it — the engine then reports unknown rather than a remembered value.',
+        },
+      },
+      required: [],
+    },
+    execute: ({ refresh, probe_engine }) =>
+      getDbaContext({ refresh: Boolean(refresh), probeEngine: probe_engine !== false }),
+  },
+  {
+    name: 'dba_raw_metadata',
+    description:
+      'Read the sys_* metadata tables that ARE the ServiceNow schema (sys_db_object, sys_dictionary, sys_choice, '
+      + 'sys_glide_object, sys_relationship, sys_number, sys_security_acl, sys_update_version, and so on) with paging '
+      + 'and two guards the plain Table API does not give you: '
+      + '(1) requesting a column that does not exist FAILS LOUDLY instead of silently omitting it, so an absent key '
+      + 'never reads as an empty value; (2) the result says whether it was truncated, so a page is never mistaken for '
+      + 'a total. '
+      + 'Some metadata tables are unreachable over REST on this instance and this tool says so by name rather than '
+      + 'returning a permissions error: sys_index and sys_package are 403 (API-level ACL), sys_index_ii does not '
+      + 'exist, and v_db_index is readable but always empty. Use get_table_schema for ordinary "what fields does this '
+      + 'table have" questions; this is for reading the metadata records themselves.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string', description: 'The metadata table to read, e.g. sys_dictionary, sys_db_object, sys_glide_object.' },
+        query: { type: 'string', description: 'Encoded query, e.g. name=incident^elementISNOTEMPTY. Check every field you reference exists — unknown fields are dropped from a query silently.' },
+        fields: { type: 'string', description: 'Comma-separated columns. Requesting one that does not exist is an error here, which is the point.' },
+        max: { type: 'number', description: 'Row ceiling for this read. Default 5000.' },
+      },
+      required: ['table'],
+    },
+    execute: async ({ table: t, query, fields, max }) => {
+      const rows = await metaQuery(t, { query, fields, max: Math.min(max || 5000, 10000) });
+      return {
+        table: t,
+        query: query || '',
+        count: rows.length,
+        truncated: rows.truncated === true,
+        ...(rows.truncated
+          ? { truncatedNote: `This is the first ${rows.length} rows, not the total. Narrow the query or raise max before reporting a count.` }
+          : {}),
+        rows,
+      };
+    },
+  },
+
+  /* ── DBA Layer 1 — Schema Intelligence. Read-only, all of it. ───────────── */
+  {
+    name: 'dba_get_table',
+    description:
+      'Describe a table: label, what it extends, its full extends chain, whether it is extendable, its direct '
+      + 'children, scope, auto-numbering prefix, and a core/custom classification. A table that does not exist '
+      + 'says so explicitly — treat that as absent, not as possibly-renamed.',
+    mutating: false,
+    inputSchema: { type: 'object', properties: { table: { type: 'string' } }, required: ['table'] },
+    execute: ({ table: t }) => dbaGetTable(t),
+  },
+  {
+    name: 'dba_list_fields',
+    description:
+      'Every column on a table with its dictionary detail: type, reference target, qualifier, max length, '
+      + 'mandatory/read-only/display/unique flags, default, and — the DBA-specific part — which table in the '
+      + 'inheritance chain actually DEFINES each one. Set include_inherited:false for only the columns this table '
+      + 'adds itself. Says if the scan was truncated; if it was, absence proves nothing.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { table: { type: 'string' }, include_inherited: { type: 'boolean', description: 'Default true.' } },
+      required: ['table'],
+    },
+    execute: ({ table: t, include_inherited }) => dbaListFields(t, { includeInherited: include_inherited !== false }),
+  },
+  {
+    name: 'dba_get_field',
+    description:
+      'One column in full, and the answer to "where does this field actually come from?" — the ORIGIN table is the '
+      + 'highest ancestor whose dictionary defines it. Also lists child-table overrides, reporting only attributes '
+      + 'whose _override flag is actually set: an override row carrying values with no flag set changes nothing.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { table: { type: 'string' }, element: { type: 'string', description: 'The column name.' } },
+      required: ['table', 'element'],
+    },
+    execute: ({ table: t, element }) => dbaGetField(t, element),
+  },
+  {
+    name: 'dba_get_hierarchy',
+    description: 'The table tree: the extends chain upward to the root, and children downward to a stated depth. '
+      + 'Says when the tree was cut, so a missing child is never mistaken for a childless table.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { table: { type: 'string' }, depth: { type: 'number', description: 'How many levels of children. Default 2.' } },
+      required: ['table'],
+    },
+    execute: ({ table: t, depth }) => dbaGetHierarchy(t, { depth: Math.min(Math.max(Number(depth) || 2, 1), 4) }),
+  },
+  {
+    name: 'dba_get_references',
+    description:
+      'Both directions of the implicit relationships: OUTBOUND (reference fields on this table, and what they point '
+      + 'at) and INBOUND (every field anywhere on the instance that points here). Use this for "show all fields '
+      + 'referencing sys_user". The inbound scan is instance-wide and reports whether it was truncated — if it was, '
+      + 'the count is a floor, not a total.',
+    mutating: false,
+    inputSchema: { type: 'object', properties: { table: { type: 'string' } }, required: ['table'] },
+    execute: ({ table: t }) => dbaGetReferences(t),
+  },
+  {
+    name: 'dba_resolve_reference',
+    description:
+      'For one reference field: the table it points at, that table\'s display field, and the qualifier with its kind '
+      + '(simple / dynamic / advanced). Reports no qualifier when none is set — use_reference_qualifier reads '
+      + '"simple" on many fields that have none, so "simple" alone does not mean one is in effect.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { table: { type: 'string' }, element: { type: 'string' } },
+      required: ['table', 'element'],
+    },
+    execute: ({ table: t, element }) => dbaResolveReference(t, element),
+  },
+  {
+    name: 'dba_dot_walk',
+    description:
+      'Validate a dot-walk path hop by hop, e.g. caller_id.department.name from incident. Returns each hop with its '
+      + 'type, or names exactly which hop failed and why (absent field, or a non-reference the path cannot continue '
+      + 'through). Use before putting a dotted field in a query: an encoded query silently DROPS a condition on an '
+      + 'unknown dot-walk and then matches everything.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { table: { type: 'string', description: 'The starting table.' }, path: { type: 'string', description: 'Dotted path, e.g. caller_id.department.name' } },
+      required: ['table', 'path'],
+    },
+    execute: ({ table: t, path }) => dbaDotWalk(t, path),
+  },
+  {
+    name: 'dba_classify',
+    description:
+      'Is this table core-ootb, ootb-customized, custom-in-scope or custom-global — and is it safe to modify? '
+      + 'Combines three independent signals (name prefix, sys_metadata_customization, sys_update_version) because '
+      + 'each alone is wrong somewhere, and returns the evidence for each. Platform tables come back "not-directly": '
+      + 'extend them through the table-augments pattern, never by editing the base object.',
+    mutating: false,
+    inputSchema: { type: 'object', properties: { table: { type: 'string' } }, required: ['table'] },
+    execute: ({ table: t }) => dbaClassify(t),
+  },
+  {
+    name: 'dba_resolve_identifier',
+    description:
+      'Turn a human identifier into {table, sys_id, display}: a prefixed number like INC0012345 (resolved through '
+      + 'the instance\'s own sys_number prefixes, not a guessed mapping), a sys_id, or a display value. A bare '
+      + 'sys_id CANNOT be resolved without a table — nothing on the instance indexes sys_id to table — and it says '
+      + 'so rather than guessing. Ambiguous matches are refused, not picked.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { value: { type: 'string' }, table: { type: 'string', description: 'Required for a bare sys_id or display value.' } },
+      required: ['value'],
+    },
+    execute: ({ value, table: t }) => dbaResolveIdentifier(value, { table: t || null }),
+  },
+  {
+    name: 'dba_list_choices',
+    description:
+      'The sys_choice entries for a field, resolved the way the platform resolves them: the most-derived table in '
+      + 'the chain that defines a set wins, and it says which table that was. Reports when a field\'s values come '
+      + 'from a choice TABLE instead of sys_choice rather than returning an empty list.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { table: { type: 'string' }, element: { type: 'string' } },
+      required: ['table', 'element'],
+    },
+    execute: ({ table: t, element }) => dbaListChoices(t, element),
+  },
+  {
+    name: 'dba_get_relationships',
+    description:
+      'Explicit relationships (sys_relationship records, for related lists no reference field can express) plus the '
+      + 'implicit ones (reference fields in both directions). Most tables have zero explicit relationships and many '
+      + 'implicit ones — that is normal, not a gap.',
+    mutating: false,
+    inputSchema: { type: 'object', properties: { table: { type: 'string' } }, required: ['table'] },
+    execute: ({ table: t }) => dbaGetRelationships(t),
+  },
+  {
+    name: 'dba_list_indexes',
+    description:
+      'Index DEFINITION RECORDS for a table, read from sys_index through a server-side script (sys_index is 403 '
+      + 'over REST here). ALWAYS PARTIAL, and it says so: sys_index holds only explicitly-defined index records — '
+      + '33 instance-wide when measured, none for incident, task or sys_user — and no reachable source on this '
+      + 'instance enumerates a table\'s physical indexes. A zero result means "no index definition record", NEVER '
+      + '"this table has no indexes". Do not report a table as unindexed from this. Costs a few seconds.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { table: { type: 'string' }, include_inherited: { type: 'boolean', description: 'Also scan ancestor tables. Default false.' } },
+      required: ['table'],
+    },
+    execute: ({ table: t, include_inherited }) => dbaListIndexes(t, { includeInherited: Boolean(include_inherited) }),
+  },
+  {
+    name: 'dba_schema_map',
+    description:
+      'A graph for rendering: nodes are tables, edges are extends / reference / relationship. DERIVED from '
+      + 'sys_db_object, sys_dictionary and sys_relationship — ServiceNow exposes no schema-map API, so the graph is '
+      + 'exactly as complete as the depth requested and nothing authoritative exists to check it against. Depth 1 on '
+      + 'incident is ~43 nodes and ~200 edges; raise depth carefully.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { table: { type: 'string' }, depth: { type: 'number', description: 'Hops to follow. Default 1. 2 is already large.' } },
+      required: ['table'],
+    },
+    execute: ({ table: t, depth }) => dbaSchemaMap(t, { depth: Math.min(Math.max(Number(depth) || 1, 0), 2) }),
+  },
+
+  /* ── DBA Layer 2 — Impact & Safety. Read-only; nothing here authorises a write. ── */
+  {
+    name: 'dba_analyze_impact',
+    description:
+      'Answer "if I change this, what breaks?" for a table or one field. There is NO out-of-the-box API for this — '
+      + 'the report is assembled by scanning the artifact tables (business rules, client scripts, UI policies, data '
+      + 'policies, ACLs, UI actions, forms, sections, lists, transform maps, relationships, notifications, reports, '
+      + 'templates, filters, child tables, inbound references), and it lists both what it scanned and what it CANNOT '
+      + 'see. Findings are ranked structural > high > medium > low. Measured: incident has 481 dependents. '
+      + 'Pass a field to also get field-level ACLs, form placements, dictionary overrides, choices and script '
+      + 'text-matches — and a warning if the field is inherited, since changing it there changes every sibling table.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string' },
+        field: { type: 'string', description: 'Optional. Analyse one column instead of the whole table.' },
+      },
+      required: ['table'],
+    },
+    execute: ({ table: t, field }) => dbaAnalyzeImpact({ table: t, field: field || null }),
+  },
+  {
+    name: 'dba_classify_operation',
+    description:
+      'Is this operation reversible on THIS instance? Returns the rollback mechanism, the live recovery verdict, the '
+      + 'retention in days read from the instance, the required role and scope constraint. '
+      + 'For engine-dependent operations the flag reflects what the instance actually supports, not the documented '
+      + 'matrix, and any divergence is stated — record_delete is documented reversible but is "partial" here. '
+      + 'Drops, renames, re-types, narrowings and truncates create NO rollback context on any engine: never describe '
+      + 'them as reversible. An unrecognised operation is treated as irreversible.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { operation: { type: 'string', description: 'e.g. drop_column, rename_table, record_delete, background_script, drop_index' } },
+      required: ['operation'],
+    },
+    execute: ({ operation }) => dbaClassifyOperation(operation),
+  },
+  {
+    name: 'dba_check_integrity',
+    description:
+      'Read-only data diagnostics for a table: empty values in mandatory columns (mandatory is enforced on the form, '
+      + 'not in the database, so historic rows routinely violate it), duplicate values in unique columns, and '
+      + 'references pointing at records that no longer exist. Every check is BOUNDED by a sample — a "clean" verdict '
+      + 'means clean within that sample and is not a proof about the whole table.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { table: { type: 'string' }, sample: { type: 'number', description: 'Rows to examine per check. Default 500.' } },
+      required: ['table'],
+    },
+    execute: ({ table: t, sample }) => dbaCheckIntegrity(t, { sample: Math.min(Math.max(Number(sample) || 500, 50), 2000) }),
+  },
+  {
+    name: 'dba_preflight',
+    description:
+      'The go/no-go gate for a proposed change: combines reversibility, impact and classification into blockers and '
+      + 'the confirmations required to proceed. Schema rules are applied only to schema operations — a record delete '
+      + 'is data and is not blocked by "this is a platform table". A "go" verdict means nothing in the preflight '
+      + 'blocks it; it does NOT mean safe. Read the impact report.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: { type: 'string' },
+        table: { type: 'string' },
+        field: { type: 'string' },
+        include_integrity: { type: 'boolean', description: 'Also run the bounded integrity checks. Slower.' },
+      },
+      required: ['operation'],
+    },
+    execute: ({ operation, table: t, field, include_integrity }) =>
+      dbaPreflight({ operation, table: t || null, field: field || null, includeIntegrity: Boolean(include_integrity) }),
+  },
+  {
+    name: 'dba_audit',
+    description:
+      'Append a DBA change to NowHelpAssist\'s own audit trail (the same mutation ledger every other write uses — '
+      + 'who, what, old, new, when, on which instance), or read back what this session recorded. The instance does '
+      + 'not record the intent behind a schema change, only its result, so this ledger is where the "why" lives.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['record', 'list'], description: 'Default list.' },
+        table: { type: 'string' },
+        sys_id: { type: 'string' },
+        operation: { type: 'string', description: 'What was done, e.g. add_column.' },
+        why: { type: 'string', description: 'The reason. This is the part the instance never keeps.' },
+        before: { type: 'object', description: 'Prior state, if known.' },
+        after: { type: 'object', description: 'New state.' },
+      },
+      required: [],
+    },
+    execute: ({ action, table: t, sys_id, operation, why, before, after }, { sessionId, turnSeq } = {}) => {
+      if (action !== 'record') {
+        return { session: sessionId, entries: mutationsForSession(sessionId, { limit: 100 }) };
+      }
+      const ok = appendMutation({
+        sessionId,
+        turnSeq: turnSeq ?? 0,
+        tool: `dba:${operation || 'change'}`,
+        descriptor: { table: t ?? null, sys_id: sys_id ?? null, requested: { operation, why, before, after } },
+        result: sys_id ? { sys_id } : null,
+        // Honest by construction: this tool records an assertion the caller
+        // made. It has verified nothing itself, and says so rather than
+        // borrowing the credibility of a real read-back.
+        verification: { status: 'unverified', by: 'dba_audit', note: 'Recorded as reported by the caller; no read-back was performed by this tool.' },
+        approval: null,
+      });
+      return ok
+        ? { recorded: true, session: sessionId, operation, table: t ?? null, why: why ?? null }
+        : { recorded: false, error: 'The audit entry could not be written to the local ledger.' };
+    },
+  },
+
+  /* ── DBA Layer 3 — Schema Authoring. The first DBA tool that writes. ────── */
+  {
+    name: 'dba_preview_table_source',
+    description:
+      'Validate a table spec and show the Fluent source it would generate, WITHOUT writing or installing anything. '
+      + 'Use this to check a spec before asking for the real thing. Reports every rule the spec breaks at once: the '
+      + '30-character name cap, the scope prefix, unsupported column types, a reference column with no target, a '
+      + 'choice column with no choices, a display column that does not exist.',
+    mutating: false,
+    inputSchema: { type: 'object', properties: { spec: { type: 'object', description: 'The table spec. See dba_create_table.' } }, required: ['spec'] },
+    execute: ({ spec }) => dbaCreateTable(spec || {}, () => {}, { dryRun: true }),
+  },
+  {
+    name: 'dba_create_table',
+    description:
+      'Create a custom table on the instance through the ServiceNow SDK: spec -> validate -> preflight -> generate '
+      + 'Fluent source -> now-sdk build (offline, free) -> install -> READ BACK -> report. '
+      + 'Schema is never written through the Table API: REST is a global-tier writer and silently demotes sys_scope '
+      + 'to global, so a "scoped" table created that way is a global one that looks right. '
+      + 'The table name must start with the application scope prefix and is capped at 30 characters. '
+      + 'allowWebServiceAccess defaults ON — without it the Table API answers 403 even with correct ACLs. '
+      + 'NOTE: now-sdk install deploys the ENTIRE application, not just this table, so every other artifact in the '
+      + 'workspace ships too and its sys_updated_on moves. '
+      + 'VERIFICATION IS INDEPENDENT: the result reports a read-back of sys_db_object and sys_dictionary over the '
+      + 'Table API — a different transport from the SDK that installed it. A green install is a claim; that '
+      + 'read-back is the evidence. '
+      + 'The whole spec is validated in ONE pass and every violation comes back together, so fix them all and call '
+      + 'again rather than one at a time. Safe corrections (scope prefix, 30-char cap, unambiguous type synonyms) '
+      + 'are applied automatically and REPORTED in `corrections`, so the approval gate shows the spec that will '
+      + 'actually be built — nothing is renamed silently. '
+      + 'Tables are STANDALONE by default; only set `extends` when the user asked for it.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        spec: {
+          type: 'object',
+          description: 'name (scope-prefixed, max 30 chars — the prefix is applied and the name trimmed for you if '
+                     + 'needed), label, display, fields[{name,type,label,maxLength,mandatory,reference,choices,'
+                     + 'default,unique}], acls[{operation,roles,field,condition}], index, autoNumber, '
+                     + 'allowWebServiceAccess, and `extends` ONLY if the user asked to extend another table. '
+                     + 'Column types: string, integer, boolean, reference, choice, date, datetime, decimal. '
+                     + 'Synonyms accepted and canonicalised: date_time/timestamp/glide_date_time -> datetime, '
+                     + 'glide_date -> date, bool -> boolean, int/number/long -> integer, float/double/currency -> '
+                     + 'decimal, str/varchar -> string, ref -> reference. "text" is NOT accepted: say string or '
+                     + 'pick a real type, because it could mean either.',
+        },
+      },
+      required: ['spec'],
+    },
+    execute: ({ spec }, ctx = {}) => {
+      const refusal = requestContractRefusal('dba_create_table', { spec }, ctx);
+      if (refusal) return refusal;
+      return dbaCreateTable(spec || {});
+    },
+  },
+  {
+    name: 'dba_table_constraints',
+    description:
+      'The rules a table spec is judged by, read live from the bound instance: the required scope prefix, the '
+      + '30-character name cap and how much of it the prefix consumes, the column types this layer can emit, the '
+      + 'type synonyms it will canonicalise for you, and what it normalizes automatically. Read this BEFORE '
+      + 'composing a dba_create_table spec so the spec is planned against the constraints instead of failing into '
+      + 'them. Read-only.',
+    mutating: false,
+    inputSchema: { type: 'object', properties: {} },
+    execute: () => dbaTableConstraints(),
+  },
+
+  /* ── DBA Layer 4 — data operations and the irreversible gate. ───────────── */
+  {
+    name: 'dba_set_field_value',
+    description:
+      'Tier 1. Change ONE field on ONE record, resolving display values for reference fields — "change the caller to '
+      + 'John Smith" looks the name up in sys_user and writes the sys_id. If the name matches more than one record, or '
+      + 'the best match is not exact, it REFUSES and returns the candidates: a wrong lookup in a write is the wrong '
+      + 'record, silently. Previews by default and writes nothing; pass confirm:true to apply. '
+      + 'The instance is read back afterwards and the READ-BACK decides the result — a 2xx can hide a discarded write, '
+      + 'and an error can accompany a change that landed. Never retried automatically.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string' },
+        sys_id: { type: 'string' },
+        field: { type: 'string' },
+        value: { type: 'string', description: 'A literal, a sys_id, or a display value to resolve.' },
+        confirm: { type: 'boolean', description: 'Default false — preview only.' },
+        why: { type: 'string', description: 'The reason, for the audit ledger. The instance never records intent.' },
+      },
+      required: ['table', 'sys_id', 'field', 'value'],
+    },
+    execute: (i, ctx) => dbaSetFieldValue(i, ctx || {}),
+  },
+  {
+    name: 'dba_delete_record',
+    description:
+      'Tier 2. Delete ONE record. Previews by default, showing the record and this instance LIVE recoverability — '
+      + 'which is three-state, not a boolean: deletes may be captured but not restorable when the Restore Deleted '
+      + 'Records plugin is off, and in that case no recovery window is promised. Reads the instance back afterwards to '
+      + 'establish what actually happened, on success and on failure alike. Never retries — retrying a delete that '
+      + 'succeeded is how one mistake becomes two.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string' },
+        sys_id: { type: 'string' },
+        confirm: { type: 'boolean', description: 'Default false — preview only.' },
+        why: { type: 'string' },
+      },
+      required: ['table', 'sys_id'],
+    },
+    execute: (i, ctx) => dbaDeleteRecord(i, ctx || {}),
+  },
+  {
+    name: 'dba_create_record',
+    description:
+      'Create a record. A field that is not a column on the table is refused BEFORE the write rather than sent — the '
+      + 'Table API accepts unknown fields and discards them silently. Read back field by field.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: { table: { type: 'string' }, values: { type: 'object' }, why: { type: 'string' } },
+      required: ['table', 'values'],
+    },
+    execute: (i, ctx) => dbaCreateRecord(i, ctx || {}),
+  },
+  {
+    name: 'dba_read_record',
+    description: 'Read one record by sys_id, optionally a named subset of fields. Read-only.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: { table: { type: 'string' }, sys_id: { type: 'string' }, fields: { type: 'string' } },
+      required: ['table', 'sys_id'],
+    },
+    execute: (i) => dbaReadRecord(i),
+  },
+  {
+    name: 'dba_recovery_status',
+    description:
+      'What this instance can actually recover from a record delete, read live: the database engine, the Delete '
+      + 'Recovery and Restore Deleted Records plugin states, and a three-state verdict. Call this before telling '
+      + 'anyone a delete can be undone. Read-only.',
+    mutating: false,
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    execute: () => dbaRecoveryStatement(),
+  },
+  {
+    name: 'dba_snapshot',
+    description:
+      'Export an object and its data before a destructive operation, returning a snapshotId the Tier 3 gate requires. '
+      + 'Captures the table record, dictionary rows, choices and up to max data rows, and says plainly when the data '
+      + 'export was truncated. This is EVIDENCE of what existed and a source to re-create from by hand — it is not a '
+      + 'restore mechanism, and the platform provides none for a drop.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: { type: 'string' },
+        table: { type: 'string' },
+        field: { type: 'string' },
+        max: { type: 'number', description: 'Data-row ceiling. Default 5000.' },
+      },
+      required: ['operation', 'table'],
+    },
+    execute: (i) => dbaSnapshot(i),
+  },
+  {
+    name: 'dba_destructive_gate',
+    description:
+      'Tier 3. Ask what it would take to perform an irreversible schema operation (drop / rename / retype / narrow / '
+      + 'truncate). THE NORMAL ANSWER IS A REFUSAL, and that is the correct outcome: these create NO rollback context '
+      + 'on any database engine and nothing can undo them. Proceeding needs four things — a human escalation enabled '
+      + 'in Settings that NO TOOL CAN SET, a pre-export snapshotId, a typed confirmation phrase naming the exact '
+      + 'target, and an acknowledged impact report. Returns which are unmet. Read-only; it performs nothing.',
+    mutating: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: { type: 'string', description: 'drop_column, drop_table, rename_table, change_column_type, …' },
+        table: { type: 'string' },
+        field: { type: 'string' },
+        snapshot_id: { type: 'string' },
+        typed_confirmation: { type: 'string' },
+        impact_acknowledged: { type: 'boolean' },
+      },
+      required: ['operation', 'table'],
+    },
+    execute: ({ operation, table: t, field, snapshot_id, typed_confirmation, impact_acknowledged }) =>
+      dbaDestructiveGate({
+        operation,
+        table: t,
+        field: field || null,
+        snapshotId: snapshot_id || null,
+        typedConfirmation: typed_confirmation || null,
+        impactAcknowledged: impact_acknowledged === true,
+      }),
+  },
+  {
+    name: 'dba_execute_irreversible',
+    description:
+      'Tier 3. Perform an irreversible schema operation. Re-runs the full gate and refuses unless all four '
+      + 'requirements are met — it cannot be talked past. Only drop_column and drop_table are implemented; renames, '
+      + 'retypes, narrowings and truncates are correctly classified, correctly gated, and deliberately left to the '
+      + 'platform UI rather than done behind a REST call that cannot be verified. Reads back afterwards and NEVER '
+      + 'describes the result as reversible.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: { type: 'string' },
+        table: { type: 'string' },
+        field: { type: 'string' },
+        snapshot_id: { type: 'string' },
+        typed_confirmation: { type: 'string' },
+        impact_acknowledged: { type: 'boolean' },
+        why: { type: 'string' },
+      },
+      required: ['operation', 'table', 'snapshot_id', 'typed_confirmation', 'impact_acknowledged'],
+    },
+    execute: ({ operation, table: t, field, snapshot_id, typed_confirmation, impact_acknowledged, why }, ctx) =>
+      dbaExecuteIrreversible({
+        operation,
+        table: t,
+        field: field || null,
+        snapshotId: snapshot_id,
+        typedConfirmation: typed_confirmation,
+        impactAcknowledged: impact_acknowledged === true,
+        why,
+      }, ctx || {}),
+  },
+  {
+    name: 'dba_column_route',
+    description:
+      'Which authoring path a column belongs on, decided from live facts: does the table exist on this instance, and '
+      + 'does this application define it in Fluent source? Returns one of create_table (new table), in_scope_source '
+      + '(a table this app owns — use dba_add_field), augment (a table another scope owns — use dba_augment_table), '
+      + 'or unmanaged_in_scope (in our scope but not in our source, which needs adopting first). '
+      + 'Call this when unsure; it prevents adding a column the wrong way. Read-only.',
+    mutating: false,
+    inputSchema: { type: 'object', properties: { table: { type: 'string' } }, required: ['table'] },
+    execute: ({ table: t }) => dbaClassifyColumnTarget(t),
+  },
+  {
+    name: 'dba_add_field',
+    description:
+      'Add a column to an existing table THIS APPLICATION OWNS (in-scope, defined in its Fluent source). '
+      + 'The column is added by editing that source and reinstalling — never by writing to sys_dictionary, because a '
+      + 'column on the instance that the source does not declare is removed again by the next install. '
+      + 'Additive only: mandatory and unique are forced off, since the table already holds rows. '
+      + 'Verifies TWO things afterwards — the column is live with the right type, and source and instance now agree. '
+      + 'For a table another scope owns use dba_augment_table; for a table that does not exist yet use '
+      + 'dba_create_table; dba_column_route will say which applies.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string' },
+        field: {
+          type: 'object',
+          description: '{name, type, label, maxLength, reference, choices, default}. Types: string, integer, boolean, reference, choice, datetime, decimal.',
+        },
+      },
+      required: ['table', 'field'],
+    },
+    execute: ({ table: t, field }) => dbaAddField(t, field || {}),
+  },
+  {
+    name: 'dba_modify_field',
+    description:
+      'Change a column that already exists on a table THIS APPLICATION OWNS. Covers the SAFE half of "modify" and '
+      + 'only that half: label, hint, help, default, and WIDENING maxLength. None of these touch stored data — a default '
+      + 'applies to rows created after it and leaves existing rows alone — and every one of them can be set back by '
+      + 'calling this again with the previous value. '
+
+      + 'Like dba_add_field it edits the Fluent source and reinstalls, never sys_dictionary, and verifies TWO things '
+      + 'afterwards: the new values are live on the instance, and source and instance agree. '
+      + 'It REFUSES the dangerous half and names it instead: NARROWING maxLength is decrease_column_width, changing '
+      + 'the type is change_column_type, renaming is rename_column — all three are irreversible, create no rollback '
+      + 'context, and are gated separately. A request that mixes safe and refused changes is refused WHOLE, so a '
+      + 'partial change is never mistaken for the whole one. Do not work around a refusal by editing the .now.ts by '
+      + 'hand, and do not substitute a different change that happens to be permitted. '
+      + 'To ADD a column use dba_add_field; to remove one use dba_drop_field; dba_column_route says which path a '
+      + 'table is on — the routing is the same for all three verbs.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string' },
+        field: { type: 'string', description: 'The existing column to change.' },
+        label: { type: 'string' },
+        hint: { type: 'string', description: 'Field hint (tooltip). Stored on sys_documentation.' },
+        help: { type: 'string', description: 'Field help text. Stored on sys_documentation.' },
+        default: { type: 'string', description: 'New default value. Applies to NEW rows only.' },
+        max_length: { type: 'number', description: 'New maxLength. Must be LARGER than the current one; narrowing is refused.' },
+      },
+      required: ['table', 'field'],
+    },
+    execute: ({ table: t, field, label, hint, help, default: def, max_length }) =>
+      dbaModifyField(t, {
+        name: field,
+        ...(label !== undefined ? { label } : {}),
+        ...(hint !== undefined ? { hint } : {}),
+        ...(help !== undefined ? { help } : {}),
+        ...(def !== undefined ? { default: def } : {}),
+        ...(max_length !== undefined ? { maxLength: max_length } : {}),
+      }),
+  },
+  {
+    name: 'dba_drop_field',
+    description:
+      'Remove a column, routed and GATED. This is the remove side of dba_add_field and it is NOT symmetric with it: '
+      + 'adding a column is additive and safe, dropping one is IRREVERSIBLE — it creates no rollback context on any '
+      + 'database engine and no delete-recovery mechanism covers schema. '
+      + 'Refused by default. Proceeding needs the operator escalation in Settings (which no tool can set), a '
+      + 'pre-export snapshotId from dba_snapshot, a typed confirmation phrase naming table.column, and an '
+      + 'acknowledged impact report — call it with no confirmations first and it will tell you exactly what is '
+      + 'missing. On a table this application owns it also removes the column from the Fluent source, so the next '
+      + 'install cannot re-create it. '
+      + 'NEVER answer a refusal by telling the user to edit the .now.ts file and reinstall by hand: that bypasses the '
+      + 'export, the confirmation and the audit trail. Report what the gate needs and stop.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string' },
+        field: { type: 'string' },
+        snapshot_id: { type: 'string', description: 'From dba_snapshot. Required to proceed.' },
+        typed_confirmation: { type: 'string', description: 'The exact phrase the gate names.' },
+        impact_acknowledged: { type: 'boolean' },
+        why: { type: 'string' },
+      },
+      required: ['table', 'field'],
+    },
+    execute: ({ table: t, field, snapshot_id, typed_confirmation, impact_acknowledged, why }, ctx) =>
+      dbaDropField({
+        table: t,
+        field,
+        snapshotId: snapshot_id || null,
+        typedConfirmation: typed_confirmation || null,
+        impactAcknowledged: impact_acknowledged === true,
+        why,
+      }, ctx || {}),
+  },
+  {
+    name: 'dba_augment_table',
+    description:
+      'Add a column to an OUT-OF-SCOPE table (an OOTB table such as incident) through the SDK table-augments pattern '
+      + 'plus a cross-scope privilege. The base object is never edited: the column is owned by this application. '
+      + 'Additive only — mandatory and unique are forced off, because a mandatory column invalidates every row that '
+      + 'predates it. The column must carry this application scope prefix. Removing it later is drop_column and is '
+      + 'irreversible, so treat an augment as permanent.',
+    mutating: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        base_table: { type: 'string' },
+        fields: {
+          type: 'array',
+          items: { type: 'object' },
+          description: 'Each: {name (scope-prefixed), type, label, maxLength, reference, choices}.',
+        },
+      },
+      required: ['base_table', 'fields'],
+    },
+    execute: ({ base_table, fields }) => dbaAugmentTable({ baseTable: base_table, fields: fields || [] }),
+  },
+
+  /* Catalogs, variable sets, custom applications, business rules, notifications,
+     server scripts and the capability inventory — see tools-extended.js. */
+  ...EXTENDED_TOOLS,
+];
+
+export const toolMap = new Map(TOOLS.map((t) => [t.name, t]));

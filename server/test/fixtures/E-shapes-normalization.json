@@ -1,0 +1,64 @@
+{
+  "note": "Field shapes the normalizer has to handle, recorded live from dev442675.",
+  "insert": {
+    "requested": {
+      "short_description": "NHA fixture shapes",
+      "impact": "1",
+      "urgency": "1",
+      "state": "2",
+      "comments": "journal text",
+      "active": true
+    },
+    "returned": {
+      "short_description": {
+        "display_value": "NHA fixture shapes",
+        "value": "NHA fixture shapes"
+      },
+      "impact": {
+        "display_value": "1 - High",
+        "value": "1"
+      },
+      "urgency": {
+        "display_value": "1 - High",
+        "value": "1"
+      },
+      "priority": {
+        "display_value": "1 - Critical",
+        "value": "1"
+      },
+      "state": {
+        "display_value": "In Progress",
+        "value": "2"
+      },
+      "comments": {
+        "display_value": "2026-08-21 00:35:07 - System Administrator (Comments)\njournal text\n\n",
+        "value": ""
+      },
+      "active": {
+        "display_value": "true",
+        "value": "true"
+      },
+      "sys_mod_count": {
+        "display_value": "0",
+        "value": "0"
+      }
+    }
+  },
+  "choiceLabel": {
+    "requested": {
+      "state": "On Hold"
+    },
+    "returned": {
+      "state": {
+        "display_value": "On Hold",
+        "value": "3"
+      }
+    }
+  },
+  "unknownField": {
+    "requested": {
+      "u_nha_not_a_field": "x"
+    },
+    "returnedHasKey": false
+  }
+}

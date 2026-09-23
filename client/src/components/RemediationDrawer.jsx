@@ -1,0 +1,446 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { api, sse } from '../api.js';
+import RecordDrawer from './RecordDrawer.jsx';
+import { ProposalChangeList, WriteGateCard, isExecutable, statusFor } from './RemediationParts.jsx';
+import { SkeletonLines } from './states.jsx';
+import { toast } from './toast.js';
+import { notifyDesktop } from './notify.js';
+
+/**
+ * THE REMEDIATION REVIEW WINDOW.
+ *
+ * Built on `RecordDrawer` — the same editing surface Incidents, Catalog, Flows,
+ * SLA, Tables and Transport already open. It is a shell that holds no record
+ * logic, which is exactly why a seventh caller is the right move rather than a
+ * seventh editor.
+ *
+ * ═══ THE ONE RULE THIS COMPONENT EXISTS TO ENFORCE ═══
+ *
+ * Nothing here has happened yet. Everything above the action bar is a PROPOSAL,
+ * and it says so in those words, at the top, until the moment a human clicks
+ * Approve and apply. The vocabulary is deliberately flat — "Proposed changes —
+ * not yet applied", then "Executing", then "Changes applied" or "Partially
+ * applied" — because a reviewer skimming this needs to know which of those
+ * three worlds they are in before they read anything else.
+ *
+ * ═══ WHY EDITING IS THE POINT, NOT A CONVENIENCE ═══
+ *
+ * The AI proposes a value for findings whose fix is a judgement call — who owns
+ * a CI, what lifecycle stage a service is in. It says what it inferred and from
+ * which field, and it is often right. It is also the kind of thing that is
+ * wrong in a way only the person who runs the estate can see. So the value is
+ * editable, individual changes are removable, and the edited version — not the
+ * draft — is what gets approved and executed.
+ *
+ * Editing invalidates the approval by design: the server returns a new
+ * fingerprint on every save, and approving sends the fingerprint the user was
+ * actually looking at. If those disagree, nothing runs.
+ */
+
+const STATE_LABEL = {
+  draft: 'Proposed changes — not yet applied',
+  edited: 'Proposed changes (edited) — not yet applied',
+  approved: 'Approved — starting',
+  executing: 'Execution in progress',
+  applied: 'Changes applied',
+  partial: 'Partially completed',
+  failed: 'Execution failed',
+  rejected: 'Rejected — nothing was changed',
+};
+
+const STATE_TONE = {
+  draft: 'warn', edited: 'warn', approved: 'ok', executing: 'ok',
+  applied: 'ok', partial: 'warn', failed: 'bad', rejected: 'idle',
+};
+
+const isSettled = (s) => ['applied', 'partial', 'failed', 'rejected'].includes(s);
+
+export default function RemediationDrawer({ open, runId, finding, onClose }) {
+  const [row, setRow] = useState(null);          // the stored proposal record
+  const [fingerprint, setFingerprint] = useState(null);
+  const [changes, setChanges] = useState([]);    // the editable working copy
+  const [userNote, setUserNote] = useState('');
+  const [busy, setBusy] = useState('');
+  const [error, setError] = useState('');
+  const [progress, setProgress] = useState(null);
+  const [rejecting, setRejecting] = useState(false);
+  const [rejectReason, setRejectReason] = useState('');
+  /* The executor's per-record approval card, while it is waiting. */
+  const [gate, setGate] = useState(null);
+  const stopRef = useRef(null);
+
+  /* Closing the drawer mid-apply stops the stream, so the server cancels the
+     waiting gate at once instead of holding it open for five minutes. */
+  useEffect(() => () => stopRef.current?.abort(), []);
+  useEffect(() => { if (!open) stopRef.current?.abort(); }, [open]);
+
+  const proposal = row?.proposal ?? null;
+  const status = row?.status ?? 'draft';
+  const settled = isSettled(status);
+
+  /** Generate a fresh proposal when the drawer opens on a finding. */
+  const generate = useCallback(async () => {
+    setBusy('generate'); setError(''); setProgress(null);
+    try {
+      const res = await api.post(`/health/runs/${runId}/findings/${finding.fingerprint}/proposal`);
+      setRow(res.proposal);
+      setFingerprint(res.fingerprint);
+      setChanges(res.proposal.proposal.changes);
+      setUserNote(res.proposal.proposal.userNote || '');
+    } catch (e) { setError(e.message); }
+    finally { setBusy(''); }
+  }, [runId, finding]);
+
+  useEffect(() => {
+    if (!open || !finding) return;
+    setRow(null); setChanges([]); setError(''); setProgress(null);
+    setRejecting(false); setRejectReason('');
+    generate();
+  }, [open, finding, generate]);
+
+  /* A change is "dirty" when the working copy differs from what is stored. The
+     approval always sends the fingerprint the user saw, so an unsaved edit
+     cannot be approved by accident — it is saved first. */
+  const dirty = useMemo(() => {
+    const stored = proposal?.changes ?? [];
+    return changes.some((c, i) => c.proposedValue !== stored[i]?.proposedValue || c.status !== stored[i]?.status)
+      || userNote !== (proposal?.userNote ?? '');
+  }, [changes, userNote, proposal]);
+
+  const executable = changes.filter(isExecutable);
+
+  const setValue = (id, value, display) => {
+    setChanges((cur) => cur.map((c) => (c.id === id
+      ? { ...c, proposedValue: value, proposedDisplay: display ?? value, status: statusFor(c, value) }
+      : c)));
+  };
+
+  const toggleRemoved = (id) => {
+    setChanges((cur) => cur.map((c) => (c.id === id
+      ? { ...c, status: c.status === 'removed' ? statusFor(c, c.proposedValue) : 'removed' }
+      : c)));
+  };
+
+  /** Save edits and take the new fingerprint. */
+  const save = async () => {
+    setBusy('save'); setError('');
+    try {
+      const res = await api.patch(`/health/proposals/${row.id}`, {
+        proposal: { changes, userNote },
+      });
+      setRow(res.proposal);
+      setFingerprint(res.fingerprint);
+      setChanges(res.proposal.proposal.changes);
+      toast.success('Plan updated. Nothing has been applied.');
+      return res.fingerprint;
+    } catch (e) { setError(e.message); return null; }
+    finally { setBusy(''); }
+  };
+
+  /**
+   * Approve and apply.
+   *
+   * Any unsaved edit is saved FIRST, and the fingerprint that comes back is the
+   * one sent. That is what makes "the agent executes what you approved" true
+   * rather than hoped for: the server compares it with what it holds and
+   * refuses on a mismatch.
+   *
+   * Two things this used to get wrong, both fixed here:
+   *
+   *   - An `error` frame was handled by THROWING inside the stream handler.
+   *     `sse()` catches handler exceptions (so one bad frame cannot kill a
+   *     stream), which meant the throw was logged and swallowed and the success
+   *     toast fired on a remediation that had been blocked. The terminal frame
+   *     is now captured and acted on after the stream ends.
+   *   - The executor asks its per-step gate before every write, and nothing
+   *     here rendered that card, so a step that got that far would have waited
+   *     for an answer nobody could give. It is rendered below and answered
+   *     through POST /api/agent/approve, the one resolver.
+   */
+  const approve = async () => {
+    const fp = dirty ? await save() : fingerprint;
+    if (!fp) return;
+    setBusy('approve'); setError(''); setProgress({ stage: 'starting' }); setGate(null);
+    const controller = new AbortController();
+    stopRef.current = controller;
+    let sessionId = null;
+    let terminal = null;
+    try {
+      await sse(`/health/proposals/${row.id}/approve`, { fingerprint: fp }, (evt) => {
+        if (evt.type === 'targets_observing') setProgress({ stage: 're-reading the records from the instance' });
+        else if (evt.type === 'plan_created') setProgress({ stage: 'plan built', steps: evt.review?.stepCount });
+        else if (evt.type === 'execution_started') {
+          sessionId = evt.sessionId ?? null;
+          setProgress({ stage: 'executing', steps: evt.steps });
+        } else if (evt.type === 'approval_required') {
+          setGate({ ...evt, sessionId });
+          notifyDesktop({
+            title: 'A fix is waiting for you to confirm a write',
+            body: evt.operation || 'Open Health Assist to apply or skip it.',
+            tag: `nha-remediation-${evt.approvalId ?? ''}`,
+            path: '/health',
+          });
+          setProgress({ stage: 'waiting for you to confirm the write below' });
+        } else if (evt.type === 'approval_resolved') setGate(null);
+        else if (evt.type === 'step_started') setProgress({ stage: `applying ${evt.step ?? ''}` });
+        else if (evt.type === 'step_failed') setProgress({ stage: `${evt.step ?? 'a step'} did not apply` });
+        else if (evt.type === 'execution_complete') setProgress({ stage: 'validating' });
+        else if (evt.type === 'done' || evt.type === 'error') terminal = evt;
+      }, 'POST', { signal: controller.signal });
+
+      if (terminal?.proposal) setRow(terminal.proposal);
+      if (!terminal || terminal.type === 'error') {
+        setError(terminal?.message || 'The remediation did not complete.');
+        toast.error('The remediation did not complete — the reason is shown in the window.');
+        notifyDesktop({ title: 'Fix did not complete', body: terminal?.message || '', tag: 'nha-remediation', path: '/health' });
+        if (!terminal?.proposal) {
+          try { setRow((await api.get(`/health/proposals/${row.id}`)).proposal); } catch { /* keep what we have */ }
+        }
+      } else if (terminal.proposal?.status === 'applied') {
+        toast.success('Changes applied and read back.');
+        notifyDesktop({ title: 'Fix applied', body: 'Every change landed and was read back.', tag: 'nha-remediation', path: '/health' });
+      } else {
+        toast.info('Finished — some changes did not apply. Check each record below.');
+        notifyDesktop({ title: 'Fix finished — not everything applied', body: 'Open Health Assist to see each record.', tag: 'nha-remediation', path: '/health' });
+      }
+    } catch (e) {
+      setError(e.cancelled
+        ? 'Stopped. Anything not yet confirmed was not sent; anything already applied is shown on each record.'
+        : e.message);
+      if (!e.cancelled) toast.error('The remediation did not complete.');
+      try { setRow((await api.get(`/health/proposals/${row.id}`)).proposal); } catch { /* keep what we have */ }
+    } finally {
+      stopRef.current = null;
+      setBusy(''); setProgress(null); setGate(null);
+    }
+  };
+
+  /** Answer the executor's card for ONE record. The stream clears it. */
+  const decide = async (approved) => {
+    if (!gate) return;
+    if (!gate.sessionId) {
+      setError('This confirmation arrived without a session, so it cannot be answered. Nothing was sent — press Stop.');
+      return;
+    }
+    setGate((g) => (g ? { ...g, sending: approved } : g));
+    try {
+      const r = await api.post('/agent/approve', {
+        sessionId: gate.sessionId, approvalId: gate.approvalId, approved, nonce: gate.nonce,
+      });
+      if (!r?.ok) {
+        setError('The write was no longer waiting for this answer — it was already answered, or it timed out.');
+      }
+    } catch (e) {
+      setError(e.message);
+      setGate((g) => (g ? { ...g, sending: undefined } : g));
+    }
+  };
+
+  const gateChange = gate
+    ? changes.find((c) => c.sys_id === gate.input?.sys_id) ?? null
+    : null;
+
+  const reject = async () => {
+    setBusy('reject'); setError('');
+    try {
+      const res = await api.post(`/health/proposals/${row.id}/reject`, { reason: rejectReason });
+      setRow(res.proposal);
+      setRejecting(false);
+      toast.success('Rejected. Nothing was changed.');
+    } catch (e) { setError(e.message); }
+    finally { setBusy(''); }
+  };
+
+  const title = finding ? `Remediation · ${finding.rule_id}` : 'Remediation';
+
+  return (
+    <RecordDrawer open={open} title={title} onClose={onClose} width={620}>
+      {busy === 'generate' && <SkeletonLines lines={10} />}
+
+      {error && <p className="error-text">{error}</p>}
+
+      {proposal && (
+        <>
+          {/* THE STATE BANNER. Always first, always in these words. */}
+          <div className={`rm-state tone-${STATE_TONE[status] || 'idle'}`}>
+            <b>{STATE_LABEL[status] || status}</b>
+            {!settled && <span>Nothing has been sent to {finding?.table ? 'your instance' : 'the instance'} yet.</span>}
+          </div>
+
+          {progress && (
+            <p className="note">Execution in progress — {progress.stage}
+              {progress.steps ? ` · ${progress.steps} step(s)` : ''}. Closing this window stops it.</p>
+          )}
+
+          {/* THE EXECUTOR'S OWN CARD, one per write. What it shows is what will
+              be sent — the table, the record and the exact data. */}
+          <WriteGateCard gate={gate} change={gateChange} onDecide={decide} onStop={() => stopRef.current?.abort()} />
+
+          {/* ── SUMMARY ─────────────────────────────────────────────── */}
+          <div className="rm-sec">What the AI recommends</div>
+          <p className="rm-lead">{proposal.summary}</p>
+
+          {proposal.needsJudgement && !settled && (
+            <div className="rm-judge">
+              <b>This needs your judgement.</b>
+              <span>{proposal.judgementNote}</span>
+            </div>
+          )}
+
+          {proposal.llm?.status && proposal.llm.status !== 'complete' && (
+            <p className="note">{proposal.llm.note}</p>
+          )}
+
+          {/* ── PROPOSED CHANGES — the editable part ─────────────────── */}
+          <div className="rm-sec">
+            Proposed changes · {executable.length} of {changes.length}
+            {settled ? '' : ' (editable)'}
+          </div>
+
+          <ProposalChangeList
+            changes={changes}
+            settled={settled}
+            results={row.execution?.results ?? null}
+            onSetValue={setValue}
+            onToggleRemoved={toggleRemoved}
+          />
+
+          {/* ── REASONING / IMPACT / VALIDATION ──────────────────────── */}
+          <div className="rm-sec">Why</div>
+          <p className="rm-lead">{proposal.reasoning}</p>
+
+          <div className="rm-sec">Impact</div>
+          <div className="rm-impact">
+            <div><b>{executable.length}</b><span>records</span></div>
+            <div><b>{proposal.table}</b><span>table</span></div>
+            <div><b>{proposal.field || '—'}</b><span>field</span></div>
+            <div>
+              <b className={proposal.reversible ? '' : 'rm-bad'}>{proposal.reversible ? 'Yes' : 'No'}</b>
+              <span>reversible</span>
+            </div>
+          </div>
+          {proposal.risks?.length > 0 && (
+            <ul className="rm-risks">{proposal.risks.map((r, i) => <li key={i}>{r}</li>)}</ul>
+          )}
+          {proposal.unreadable?.length > 0 && (
+            <p className="note">
+              {proposal.unreadable.length} record(s) could not be read and are not included:{' '}
+              {proposal.unreadable.map((u) => u.reason).join('; ')}.
+            </p>
+          )}
+          {proposal.truncated > 0 && (
+            <p className="note">
+              {proposal.truncated} further affected record(s) are not in this plan. Apply this batch, then generate again.
+            </p>
+          )}
+
+          <div className="rm-sec">How it will be checked</div>
+          <p className="rm-lead">{proposal.validation}</p>
+
+          {/* ── NOTES TO THE AGENT ───────────────────────────────────── */}
+          {!settled && (
+            <>
+              <div className="rm-sec">Notes or corrections (optional)</div>
+              <textarea
+                className="input rm-note-input"
+                rows={2}
+                value={userNote}
+                onChange={(e) => setUserNote(e.target.value)}
+                placeholder="Anything the agent should know when it applies this…"
+              />
+            </>
+          )}
+
+          {/* ── WHAT HAPPENED ───────────────────────────────────────── */}
+          {row.validation && (
+            <>
+              <div className="rm-sec">Validation</div>
+              {row.validation.skipped ? (
+                <p className="rm-verdict tone-idle">Not validated — nothing was applied.</p>
+              ) : (
+                <p className={`rm-verdict tone-${row.validation.ok ? 'ok' : 'bad'}`}>
+                  {row.validation.ok ? 'Validation successful' : 'Validation failed'} —{' '}
+                  {row.validation.cleared} of {row.validation.total} applied record(s) hold the approved value.
+                </p>
+              )}
+              <p className="rm-note">{row.validation.note}</p>
+            </>
+          )}
+
+          {status === 'rejected' && row.rejectReason && (
+            <p className="rm-note"><b>Reason given:</b> {row.rejectReason}</p>
+          )}
+
+          {row.taskId && (
+            <p className="rm-note">
+              Executed as task <code className="mono">{row.taskId.slice(0, 8)}</code> — it appears in NHA Logs with every
+              step, its approval and its read-back.
+            </p>
+          )}
+
+          {/* ── ACTIONS ─────────────────────────────────────────────── */}
+          {!settled && (
+            <div className="rm-actions">
+              {rejecting ? (
+                <>
+                  <input
+                    className="input"
+                    value={rejectReason}
+                    onChange={(e) => setRejectReason(e.target.value)}
+                    placeholder="Why are you rejecting it? (optional)"
+                  />
+                  <button type="button" className="btn danger" onClick={reject} aria-busy={busy === 'reject'}>
+                    Confirm reject
+                  </button>
+                  <button type="button" className="btn ghost" onClick={() => setRejecting(false)}>Cancel</button>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="btn primary"
+                    onClick={approve}
+                    aria-busy={busy === 'approve'}
+                    disabled={Boolean(busy) || executable.length === 0}
+                    title={executable.length === 0 ? 'Nothing to apply — every change is removed or has no value.' : undefined}
+                  >
+                    Approve and apply {executable.length > 0 ? `(${executable.length})` : ''}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={save}
+                    aria-busy={busy === 'save'}
+                    disabled={!dirty || Boolean(busy)}
+                  >
+                    Save edits
+                  </button>
+                  <button type="button" className="btn ghost" onClick={() => setRejecting(true)} disabled={Boolean(busy)}>
+                    Reject
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+
+          {!settled && (
+            <p className="rm-fine">
+              Approve and apply sends <b>this exact list</b> to the agent, which writes it through the same gate,
+              read-back and audit trail as every other change in this app. If you edit after approving, the approval
+              stops applying and nothing runs.
+            </p>
+          )}
+
+          {settled && (
+            <div className="rm-actions">
+              <button type="button" className="btn" onClick={generate} aria-busy={busy === 'generate'}>
+                Generate a new plan
+              </button>
+              <button type="button" className="btn ghost" onClick={onClose}>Close</button>
+            </div>
+          )}
+        </>
+      )}
+    </RecordDrawer>
+  );
+}

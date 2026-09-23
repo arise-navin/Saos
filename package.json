@@ -1,0 +1,17 @@
+{
+  "name": "nowhelpassist",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:server": "npm run dev --prefix server",
+    "dev:client": "npm run dev --prefix client",
+    "build:client": "npm run build --prefix client",
+    "build": "npm run build:client",
+    "test": "npm test --prefix server"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
+

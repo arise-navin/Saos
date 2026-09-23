@@ -1,0 +1,12 @@
+# The repo is LF throughout. This is not a style preference — without it, an
+# editor or script on a Windows machine can rewrite a whole file's line endings
+# while changing four lines, which buries a real diff under a few hundred
+# phantom ones and makes review useless.
+* text=auto eol=lf
+
+# Binary, never touched.
+*.zip binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.db  binary

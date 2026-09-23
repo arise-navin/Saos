@@ -1,0 +1,32 @@
+{
+  "note": "sys_update_set create with a scoped application. HTTP 201, application forced to global. Recorded live from dev442675.",
+  "table": "sys_update_set",
+  "operation": "insert",
+  "requested": {
+    "name": "NHA E2 fixture",
+    "application": "c44f3c6c37c24793be9f8b759c7818e4",
+    "state": "in progress"
+  },
+  "returned": {
+    "name": {
+      "display_value": "NHA E2 fixture",
+      "value": "NHA E2 fixture"
+    },
+    "application": {
+      "display_value": "Global",
+      "value": "global"
+    },
+    "state": {
+      "display_value": "In progress",
+      "value": "in progress"
+    },
+    "sys_id": {
+      "display_value": "1bb7509a83b6c750b939cc65eeaad3bf",
+      "value": "1bb7509a83b6c750b939cc65eeaad3bf"
+    },
+    "sys_mod_count": {
+      "display_value": "0",
+      "value": "0"
+    }
+  }
+}

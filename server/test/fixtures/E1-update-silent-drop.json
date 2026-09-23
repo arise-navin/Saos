@@ -1,0 +1,44 @@
+{
+  "note": "sys_update_set.application update. HTTP 2xx, value unchanged, sys_mod_count and sys_updated_on frozen. Recorded live from dev442675.",
+  "table": "sys_update_set",
+  "operation": "update",
+  "requested": {
+    "application": "c44f3c6c37c24793be9f8b759c7818e4"
+  },
+  "before": {
+    "application": {
+      "display_value": "Global",
+      "value": "global"
+    },
+    "sys_mod_count": {
+      "display_value": "0",
+      "value": "0"
+    },
+    "sys_updated_on": {
+      "display_value": "2026-08-17 04:23:38",
+      "value": "2026-08-17 11:23:38"
+    }
+  },
+  "returned": {
+    "application": {
+      "display_value": "Global",
+      "value": "global"
+    },
+    "sys_mod_count": {
+      "display_value": "0",
+      "value": "0"
+    },
+    "sys_updated_on": {
+      "display_value": "2026-08-17 04:23:38",
+      "value": "2026-08-17 11:23:38"
+    },
+    "sys_id": {
+      "display_value": "29b5648983be0f10b939cc65eeaad36b",
+      "value": "29b5648983be0f10b939cc65eeaad36b"
+    },
+    "name": {
+      "display_value": "AGAMYA_Scope",
+      "value": "AGAMYA_Scope"
+    }
+  }
+}
