@@ -1,15 +1,16 @@
 {
   "version": 2,
   "buildCommand": "npm run build:client",
-  "outputDirectory": "client/dist",
   "installCommand": "npm install --prefix server && npm install --prefix client",
-  "functions": {
-    "api/[...path].js": {
-      "maxDuration": 60
-    }
-  },
-  "rewrites": [
-    { "source": "/((?!api).*)", "destination": "/index.html" }
+  "builds": [
+    { "src": "api/index.js", "use": "@vercel/node" },
+    { "src": "client/dist/**", "use": "@vercel/static" }
+  ],
+  "routes": [
+    { "src": "/api/(.*)", "dest": "/api/index.js" },
+    { "src": "/assets/(.*)", "dest": "/client/dist/assets/$1" },
+    { "src": "/favicon.svg", "dest": "/client/dist/favicon.svg" },
+    { "src": "/(.*)", "dest": "/client/dist/index.html" }
   ],
   "env": {
     "NODE_ENV": "production"
