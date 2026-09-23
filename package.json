@@ -4,6 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
+    "install": "npm install --prefix server && npm install --prefix client",
     "dev": "node scripts/dev.mjs",
     "dev:server": "npm run dev --prefix server",
     "dev:client": "npm run dev --prefix client",
