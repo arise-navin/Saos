@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, sse } from '../api.js';
-import { backendBlob } from '../backend.js';
 import { toast } from '../components/toast.js';
 import { confirmDestructive } from '../components/confirm.js';
 import { SkeletonRows, LoadingRegion, EmptyState } from '../components/states.jsx';
@@ -265,15 +264,9 @@ function MeetingDetail({ id, onBack, onChanged }) {
     setTimeout(() => setHighlight((cur) => (cur === segIdx ? null : cur)), 2500);
   };
 
-  const play = async (seg) => {
+  const play = (seg) => {
     audioRef.current?.pause();
-    let url;
-    try { url = URL.createObjectURL(await backendBlob(`/api/meetings/${id}/segment/${seg.idx}/audio`)); }
-    catch (err) { toast.error(err.message); return; }
-    const a = new Audio(url);
-    a.addEventListener('ended', () => URL.revokeObjectURL(url), { once: true });
-    a.addEventListener('error', () => URL.revokeObjectURL(url), { once: true });
-    a.addEventListener('pause', () => URL.revokeObjectURL(url), { once: true });
+    const a = new Audio(`/api/meetings/${id}/segment/${seg.idx}/audio`);
     audioRef.current = a;
     setPlaying(seg.idx);
     a.onended = () => setPlaying(null);

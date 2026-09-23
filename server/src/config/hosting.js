@@ -4,11 +4,14 @@ export function hostingConfig(env = process.env) {
   const hosted = env.RENDER === 'true';
   const token = env.API_ACCESS_TOKEN || '';
   const origins = (env.FRONTEND_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean);
-  if (hosted && (!token || !origins.length || !env.TURSO_DATABASE_URL || !env.TURSO_AUTH_TOKEN)) {
-    throw new Error('Render requires API_ACCESS_TOKEN, FRONTEND_ORIGIN, TURSO_DATABASE_URL and TURSO_AUTH_TOKEN.');
+
+  if (hosted && (!token || !origins.length)) {
+    throw new Error('Render requires API_ACCESS_TOKEN and FRONTEND_ORIGIN.');
   }
   for (const origin of origins) {
-    if (new URL(origin).origin !== origin) throw new Error('FRONTEND_ORIGIN must contain origins without paths or trailing slashes.');
+    if (new URL(origin).origin !== origin) {
+      throw new Error('FRONTEND_ORIGIN must contain origins without paths or trailing slashes.');
+    }
   }
   return { hosted, token, origins };
 }

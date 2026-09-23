@@ -1,6 +1,5 @@
 import express from 'express';
 import cors from 'cors';
-import { hostingConfig, accessGuard } from './config/hosting.js';
 import { systemRouter } from './routes/system.js';
 import { incidentsRouter } from './routes/incidents.js';
 import { catalogRouter } from './routes/catalog.js';
@@ -21,15 +20,17 @@ import { knowledgeRouter } from './routes/knowledge.js';
 import { skillsRouter } from './routes/skills.js';
 import { healthRouter } from './routes/health.js';
 import { attachmentsRouter } from './routes/attachments.js';
+import { healthDimensionsRouter } from './routes/health-dimensions.js';
 import { log, requestLogger, banner } from './logging.js';
 import { SnowError } from './servicenow/client.js';
 import { getDb } from './memory/db.js';
 import { seedLedger } from './memory/facts.js';
 import { getSettings } from './config/store.js';
+import { accessGuard, hostingConfig } from './config/hosting.js';
 // Loaded for its side effect: registers the instance-switch hook on config/store
 // so no path can save a connection without per-instance state being flushed (B6).
 import { boundInstance } from './servicenow/instance-binding.js';
-import { DB_PATH, IS_TURSO } from './memory/db.js';
+import { DB_PATH } from './memory/db.js';
 // Registration side effect: hooks the post-install state reconciler onto every
 // deploy, so an install cannot silently revert an out-of-SDK-model flag (F1).
 import './servicenow/post-install-state.js';
@@ -37,16 +38,12 @@ import { primeCapability } from './servicenow/fluent.js';
 
 const app = express();
 const hosting = hostingConfig();
-app.get('/healthz', (_req, res) => res.json({ ok: true }));
-app.use(cors({ origin: hosting.origins.length ? hosting.origins : true }));
-app.use('/api', accessGuard(hosting.token));
+app.use(cors(hosting.origins.length ? { origin: hosting.origins } : undefined));
 app.use(express.json({ limit: '2mb' }));
 // Before the routes, so a request is logged even when it 404s.
 app.use(requestLogger());
-
-// Detected at boot. On Vercel: no TCP listener, no meetings file-system features.
-const IS_VERCEL = Boolean(process.env.VERCEL);
-
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
+app.use('/api', accessGuard(hosting.token));
 
 app.use('/api/system', systemRouter);
 app.use('/api/incidents', incidentsRouter);
@@ -81,6 +78,12 @@ app.use('/api/skills', skillsRouter);
 
 // Health Assist. Read-only estate analysis: extraction through the one client,
 // deterministic rules, and a manifest that says what it could not see.
+// Finding dimensions are mounted first: a classification layered over
+// findings, with its own tables and no path to a finding row or the instance.
+// `/categories` is the pre-rename address, kept as a deprecated alias of the
+// same router so nothing that still calls it breaks; `/dimensions` is canonical.
+app.use('/api/health/dimensions', healthDimensionsRouter);
+app.use('/api/health/categories', healthDimensionsRouter);
 app.use('/api/health', healthRouter);
 
 // eslint-disable-next-line no-unused-vars
@@ -107,9 +110,6 @@ process.on('uncaughtException', (err) => { log.error('process', 'uncaught except
 
 const PORT = Number(process.env.PORT) || 4000;
 
-// Export app for Vercel serverless handler and for tests
-export { app };
-
 /*
  * WI-3 — THE LISTENER BINDS LOOPBACK, AND SAYS SO IF IT CANNOT.
  *
@@ -126,16 +126,14 @@ export { app };
  * it happens to be on, with nothing anywhere saying which one that was.
  */
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1']);
-const HOST = process.env.HOST || '127.0.0.1';
-// On Vercel there is no TCP listener, so the loopback guard does not apply.
-if (!IS_VERCEL && !hosting.hosted && !LOOPBACK.has(HOST)) {
+const HOST = process.env.HOST || (hosting.hosted ? '0.0.0.0' : '127.0.0.1');
+if (!hosting.hosted && !LOOPBACK.has(HOST)) {
   log.error('http',
     `refusing to bind ${HOST}: NowHelpAssist is unauthenticated and holds instance admin credentials, ` +
     `and its approval endpoint authorises writes to ${getSettings().connection.instanceUrl || 'the bound instance'}. ` +
     `It may only listen on loopback (${[...LOOPBACK].join(', ')}). Unset HOST, or put a real proxy in front of it.`);
   process.exit(1);
 }
-
 
 // Storage comes up before the listener: migrations are idempotent, and a
 // database that cannot open should stop the server rather than fail the first
@@ -150,22 +148,18 @@ const seeded = seedLedger();
  * capabilities are honestly UNKNOWN; after it they stay known across every
  * TTL refresh (stale-while-revalidate in fluent.js).
  */
-if (!IS_VERCEL && !hosting.hosted) primeCapability();
+primeCapability();
 
-
-let orphans = 0, requeued = 0;
-if (!IS_VERCEL) {
-  /*
-   * The transcription queue is in memory, so a restart mid-meeting would leave
-   * every already-captured utterance permanently untranscribed while its audio
-   * sat on disk — a hole in the transcript that nothing would ever fill and
-   * nothing would report. Re-queuing on boot is what makes the crash-safety
-   * claim in meetings/queue.js true rather than aspirational.
-   */
-  // A meeting still marked `recording` at boot is one the agent never closed.
-  orphans = closeOrphanedRecordings();
-  requeued = requeuePending();
-}
+/*
+ * The transcription queue is in memory, so a restart mid-meeting would leave
+ * every already-captured utterance permanently untranscribed while its audio
+ * sat on disk — a hole in the transcript that nothing would ever fill and
+ * nothing would report. Re-queuing on boot is what makes the crash-safety
+ * claim in meetings/queue.js true rather than aspirational.
+ */
+// A meeting still marked `recording` at boot is one the agent never closed.
+const orphans = closeOrphanedRecordings();
+const requeued = requeuePending();
 
 /*
  * The listener, and why it is not a one-liner any more.
@@ -204,12 +198,10 @@ function start(attempt = 1) {
   server = app.listen(PORT, HOST, () => {
     const s = getSettings();
     banner([
-      `NowHelpAssist  ·  http://localhost:${PORT}   (bound ${HOST})`,
+      `NowHelpAssist  ·  http://localhost:${PORT}   (bound ${HOST} — loopback only)`,
       `instance   ${s.connection.instanceUrl || '(none bound)'}   (both tiers derive from this)`,
       `model      ${s.llm.provider} · ${s.llm.model || '(default)'}`,
-      IS_TURSO
-        ? `storage    Turso (cloud) · ${DB_PATH}`
-        : `storage    ${DB_PATH}`,
+      `storage    ${DB_PATH}`,
       `ledger     ${seeded.seeded} facts for ${seeded.instance}`,
       `meetings   ${requeued} utterance(s) re-queued${orphans ? `, ${orphans} stuck meeting(s) closed` : ''}`,
       `log level  ${log.level}   (LOG_LEVEL=debug for polls and reads)`,
@@ -263,7 +255,6 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.on(sig, () => shutdown(sig));
 }
 
-// On Vercel, don't start the TCP listener — the serverless handler is invoked directly.
-if (!IS_VERCEL) {
-  start();
-}
+start();
+
+export { app };

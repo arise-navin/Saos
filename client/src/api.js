@@ -1,7 +1,12 @@
 import { logToServer } from './logging.js';
-import { API_BASE, backendFetch } from './backend.js';
 
-const BASE = API_BASE;
+const BASE = (import.meta.env.VITE_API_URL || '/api').replace(/\/+$/, '');
+const API_TOKEN = import.meta.env.VITE_API_ACCESS_TOKEN || '';
+
+function headers(extra = {}) {
+  const token = localStorage.getItem('saos.apiToken') || API_TOKEN;
+  return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
+}
 
 /**
  * Every call reports its outcome to the server terminal.
@@ -14,35 +19,24 @@ const BASE = API_BASE;
 async function request(method, path, body) {
   const start = Date.now();
   let res;
-  let text;
   try {
-    res = await backendFetch(BASE + path, {
+    res = await fetch(BASE + path, {
       method,
-      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      headers: headers(body ? { 'Content-Type': 'application/json' } : {}),
       body: body ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(path === '/system/settings' ? 30_000 : 300_000),
     });
-    text = await res.text();
   } catch (err) {
-    if (err.name === 'TimeoutError') {
-      throw new Error('The server took too long to respond. Reload to check whether the change was saved before retrying.');
-    }
     // The server is unreachable — the one failure the server cannot log.
     logToServer('error', `${method} ${path} — network failure: ${err.message}`);
     throw err;
   }
+  const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { /* non-JSON */ }
   if (!res.ok) {
-    const platformError = res.headers.get('x-vercel-error');
-    const message = data?.message || (platformError
-      ? `Deployment error: ${platformError}. Check Vercel Runtime Logs.`
-      : `Request failed (${res.status})`);
+    const message = data?.message || `Request failed (${res.status})`;
     logToServer('error', `${method} ${path} → ${res.status}  ${message}`, data?.detail);
     throw new Error(message);
-  }
-  if (text && data === null) {
-    throw new Error('The API returned an invalid response. Check the deployment API routing.');
   }
   logToServer('debug', `${method} ${path} → ${res.status}  ${Date.now() - start}ms`);
   return data;
@@ -66,9 +60,9 @@ async function upload(path, file, signal) {
   const start = Date.now();
   let res;
   try {
-    res = await backendFetch(BASE + path, {
+    res = await fetch(BASE + path, {
       method: 'POST',
-      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      headers: headers({ 'Content-Type': file.type || 'application/octet-stream' }),
       body: file,
       signal,
     });
@@ -135,9 +129,9 @@ function cancelledError() {
 export async function sse(path, body, onEvent, method = 'POST', { signal } = {}) {
   let res;
   try {
-    res = await backendFetch(BASE + path, {
+    res = await fetch(BASE + path, {
       method,
-      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      headers: headers(body ? { 'Content-Type': 'application/json' } : {}),
       body: body ? JSON.stringify(body) : undefined,
       signal,
     });

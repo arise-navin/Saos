@@ -6,13 +6,19 @@ services:
     buildCommand: npm ci --prefix server
     startCommand: node server/src/index.js
     healthCheckPath: /healthz
+    disk:
+      name: saos-data
+      mountPath: /var/data/saos
+      sizeGB: 1
     envVars:
       - key: NODE_VERSION
         value: 24
       - key: NODE_ENV
         value: production
-      - key: HOST
-        value: 0.0.0.0
+      - key: RENDER
+        value: "true"
+      - key: SAOS_DATA_DIR
+        value: /var/data/saos
       - key: FRONTEND_ORIGIN
         sync: false
       - key: API_ACCESS_TOKEN

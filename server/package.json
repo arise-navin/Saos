@@ -4,17 +4,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node --env-file=.env --watch src/index.js",
-    "dev:noenv": "node --watch src/index.js",
-    "start": "node --env-file=.env src/index.js",
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
     "test": "node --test test/*.test.js",
     "doctor": "node scripts/flow-doctor.mjs",
     "flow:readback": "node scripts/flow-readback.mjs",
     "flow:matrix": "node scripts/flow-e2e-matrix.mjs"
   },
-
   "dependencies": {
-    "@libsql/client": "^0.18.0",
     "@napi-rs/canvas": "^1.0.9",
     "@tesseract.js-data/eng": "^1.0.0",
     "cors": "^2.8.5",

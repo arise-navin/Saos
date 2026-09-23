@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../api.js';
 import { toast } from '../components/toast.js';
-import { downloadFile } from '../backend.js';
 import { SkeletonRows, LoadingRegion } from '../components/states.jsx';
 import DataTable from '../components/DataTable.jsx';
 import RecordDrawer from '../components/RecordDrawer.jsx';
@@ -274,7 +273,7 @@ export default function Audit() {
             {/* Content-Disposition on the server makes this a download; the
                 query string is the page's own filters, so the file matches
                 what is on screen rather than dumping the whole table. */}
-            <a className="btn primary sm" href="#" onClick={(event) => { event.preventDefault(); downloadFile(`/api/audit/export.csv?${query()}`, 'audit.csv').catch((err) => toast.error(err.message)); }}>
+            <a className="btn primary sm" href={`/api/audit/export.csv?${query()}`} download>
               Export CSV
             </a>
           </div>

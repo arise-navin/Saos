@@ -2,297 +2,32 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { Worker } from 'node:worker_threads';
-import { createRequire } from 'node:module';
 import { log } from '../logging.js';
-
-const require = createRequire(import.meta.url);
 
 /**
  * One SQLite file for everything NowHelpAssist needs to remember: sessions,
  * messages, tool events, the per-instance knowledge ledger, and recall
  * embeddings.
  *
- * Storage mode is selected at boot:
+ * Why the built-in `node:sqlite` rather than better-sqlite3 — this was checked,
+ * not assumed. On this machine (Node v24.18.0) the built-in covers every need:
  *
- *   TURSO_DATABASE_URL + TURSO_AUTH_TOKEN set  →  Turso cloud SQLite
- *   (neither set)                              →  local node:sqlite file
+ *   DatabaseSync / StatementSync   present
+ *   BLOB round-trip (Uint8Array)   works — needed for float32 embeddings
+ *   FTS5 virtual tables            available — needed for the keyword fallback
  *
- * The Turso path uses @libsql/client in synchronous-bridge mode: every async
- * call is resolved with Atomics.wait on a SharedArrayBuffer so the rest of this
- * file — which was written against DatabaseSync — sees an identical interface
- * with no changes to the caller code. The bridge adds ~0.2 ms per statement on
- * loopback; latency to ap-south-1 is typically 20–60 ms and is the expected
- * cost of running cloud storage.
+ * That makes the whole storage layer dependency-free, which matters here: this
+ * is a Windows machine with no node-gyp toolchain, and better-sqlite3 would
+ * have meant relying on a prebuilt binary matching this exact Node ABI.
  *
- * Migrations are idempotent and run on boot, keyed on `PRAGMA user_version`
- * (local) or a `schema_version` table (Turso), so starting an older or newer
- * server against an existing database is safe.
+ * Migrations are idempotent and run on boot, keyed on `PRAGMA user_version`, so
+ * starting an older or newer server against an existing file is safe.
  */
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = process.env.NOWHELPASSIST_DATA_DIR || (process.env.VERCEL
-  ? path.join('/tmp', 'nowhelpassist')
-  : path.resolve(__dirname, '../../data'));
+const DATA_DIR = path.resolve(process.env.SAOS_DATA_DIR || path.resolve(__dirname, '../../data'));
 const DB_FILE = path.join(DATA_DIR, 'nowhelpassist.db');
 const LEGACY_DB_FILE = path.join(DATA_DIR, 'nowforge.db');
-
-// ── Turso detection ─────────────────────────────────────────────────────────
-const TURSO_URL   = process.env.TURSO_DATABASE_URL;
-const TURSO_TOKEN = process.env.TURSO_AUTH_TOKEN;
-const USE_TURSO   = Boolean(TURSO_URL && TURSO_TOKEN);
-
-/**
- * Split a SQL migration block into individual executable statements.
- *
- * Naive semicolon splitting breaks on:
- *   1. SQL line comments (-- text; more text) — the semicolon is in a comment
- *   2. CREATE TRIGGER ... BEGIN ... END — the body contains semicolons
- *
- * This parser strips line comments, tracks BEGIN/END nesting depth, and only
- * splits on a semicolon when depth is 0.
- *
- * @param {string} sql  Raw SQL block (may contain multiple statements)
- * @returns {string[]}  Array of individual statements, each trimmed
- */
-function splitSql(sql) {
-  const statements = [];
-  let current = '';
-  let depth = 0; // nesting depth for BEGIN...END trigger blocks
-
-  const lines = sql.split('\n');
-  for (const rawLine of lines) {
-    // Strip SQL line comments (-- ...) before processing
-    const commentIdx = rawLine.indexOf('--');
-    const line = commentIdx >= 0 ? rawLine.slice(0, commentIdx) : rawLine;
-
-    // Scan left-to-right, tracking keywords and semicolons
-    let i = 0;
-    while (i < line.length) {
-      const remaining = line.slice(i);
-      // Match an identifier/keyword at current position
-      const wordMatch = remaining.match(/^([A-Za-z_]\w*)/);
-
-      if (wordMatch) {
-        const word = wordMatch[1].toUpperCase();
-        current += wordMatch[1];
-        i += wordMatch[1].length;
-        if (word === 'BEGIN') depth++;
-        else if (word === 'END') depth = Math.max(0, depth - 1);
-      } else if (line[i] === ';' && depth === 0) {
-        // Statement boundary at depth 0 — save and reset
-        const stmt = current.trim();
-        if (stmt) statements.push(stmt);
-        current = '';
-        i++;
-      } else {
-        current += line[i];
-        i++;
-      }
-    }
-    current += '\n';
-  }
-  // Any trailing content without a final semicolon
-  const trailing = current.trim();
-  if (trailing) statements.push(trailing);
-  return statements.filter((s) => s.trim());
-}
-
-
-
-/**
- * TursoSyncDB — a synchronous-looking wrapper over @libsql/client.
- *
- * WHY THIS EXISTS: The rest of this module was written against node:sqlite's
- * DatabaseSync, which is fully synchronous. Turso's @libsql/client is async.
- * Rather than rewriting every caller, we bridge the gap using worker_threads:
- * each SQL call spawns a tiny Worker that awaits the Turso HTTP request, then
- * signals the main thread via a SharedArrayBuffer. The main thread blocks with
- * Atomics.wait until the Worker signals done.
- *
- * SharedArrayBuffer is safe here because Node ≥ 22 enables it by default when
- * the Cross-Origin-Isolation headers are NOT required (process-level usage
- * does not require them).
- *
- * This is used ONLY for migrations at boot. After boot, the async client is
- * used directly from async routes. Blocking the event loop during the
- * migration phase is acceptable — the listener hasn't started yet.
- */
-class TursoSyncDB {
-  /** @param {import('@libsql/client').Client} asyncClient */
-  constructor(asyncClient) {
-    this._client = asyncClient;
-    // The worker script is inlined as a string and evaluated via `eval: true`.
-    // It uses CommonJS-style require because worker_threads inline scripts run
-    // in CommonJS context (Node does not treat eval: true as ESM).
-    this._workerSrc = `
-const { workerData } = require('worker_threads');
-
-(async () => {
-  const flag = new Int32Array(workerData.sab, 0, 1);
-  const body = new Uint8Array(workerData.sab, 8);
-  let client;
-  try {
-    const { createClient } = require(workerData.clientPath);
-    client = createClient({ url: workerData.url, authToken: workerData.token });
-    const rs = await client.execute({ sql: workerData.sql, args: workerData.args || [] });
-    // Serialize rows — Turso rows are array-like with named properties
-    const rows = Array.from(rs.rows).map((r) => {
-      const obj = {};
-      (rs.columns || []).forEach((col, i) => { obj[col] = r[i] ?? null; });
-      return obj;
-    });
-    const payload = Buffer.from(JSON.stringify({
-      ok: true, rows, columns: rs.columns, changes: rs.rowsAffected,
-      lastInsertRowid: rs.lastInsertRowid == null ? null : String(rs.lastInsertRowid),
-    }));
-    if (payload.length > body.byteLength) throw new Error('Turso result exceeds the synchronous bridge response limit.');
-    body.set(payload);
-  } catch (e) {
-    const payload = Buffer.from(JSON.stringify({ ok: false, error: e.message }));
-    body.set(payload.slice(0, body.byteLength));
-  } finally {
-    Atomics.store(flag, 0, 1);
-    Atomics.notify(flag, 0, 1);
-    client?.close();
-  }
-})();
-`;
-  }
-
-
-
-  _runSyncBlocking(sql, args = []) {
-    // 4-byte flag + 4-byte padding + 2MB payload
-    const sab  = new SharedArrayBuffer(8 + 2 * 1024 * 1024);
-    const flag = new Int32Array(sab, 0, 1);
-    const body = new Uint8Array(sab, 8);
-
-    const worker = new Worker(this._workerSrc, {
-      eval: true,
-      workerData: {
-        url: TURSO_URL, token: TURSO_TOKEN, sql, args, sab,
-        clientPath: require.resolve('@libsql/client'),
-      },
-    });
-    worker.on('error', (error) => log.error('storage', 'Turso worker failed', error));
-
-    // Block main thread until worker signals (timeout: 60 s for slow cloud)
-    const result = Atomics.wait(flag, 0, 0, 60_000);
-    worker.terminate();
-
-    if (result === 'timed-out') {
-      throw new Error(`Turso query timed out (60 s): ${sql.slice(0, 120)}`);
-    }
-
-    // Decode the payload — find the first null byte to trim
-    let end = body.byteLength;
-    for (let i = 0; i < body.byteLength; i++) {
-      if (body[i] === 0) { end = i; break; }
-    }
-    const json = new TextDecoder().decode(body.slice(0, end));
-    let parsed;
-    try { parsed = JSON.parse(json); } catch {
-      throw new Error(`Turso: could not parse worker result for: ${sql.slice(0, 80)}`);
-    }
-    if (!parsed.ok) throw new Error(`Turso query failed: ${parsed.error}\n  SQL: ${sql.slice(0, 200)}`);
-    return parsed;
-  }
-
-  exec(sql) {
-    // PRAGMA user_version = N  is a special form we handle separately
-    // (Turso doesn't honour SQLite PRAGMAs — we track version in a table)
-    const pragmaSet = /^\s*PRAGMA\s+user_version\s*=\s*(\d+)/i.exec(sql);
-    if (pragmaSet) {
-      const v = Number(pragmaSet[1]);
-      this._runSyncBlocking(
-        `INSERT INTO _schema_version(id, version, updated_at) VALUES(1, ?, ?) ON CONFLICT(id) DO UPDATE SET version=excluded.version, updated_at=excluded.updated_at`,
-        [v, new Date().toISOString()]
-      );
-      return;
-    }
-    // Skip other PRAGMAs (WAL, busy_timeout, etc.) — not applicable to Turso
-    if (/^\s*PRAGMA\b/i.test(sql) && !/^\s*PRAGMA\s+user_version\s*$/i.test(sql)) return;
-    // BEGIN / COMMIT / ROLLBACK — Turso handles transactions differently.
-    // During migrations we just execute eagerly (each statement is atomic on Turso).
-    if (/^\s*(BEGIN|COMMIT|ROLLBACK)\s*$/i.test(sql.trim())) return;
-
-    // Split into individual statements, respecting:
-    //   - SQL line comments (-- ...)
-    //   - CREATE TRIGGER ... BEGIN ... END blocks (nested semicolons)
-    //   - Normal semicolon-delimited statements
-    for (const stmt of splitSql(sql)) {
-      if (!stmt) continue;
-      if (/^\s*(PRAGMA|BEGIN|COMMIT|ROLLBACK)\b/i.test(stmt)) continue;
-      this._runSyncBlocking(stmt, []);
-    }
-  }
-
-
-  prepare(sql) {
-    const self = this;
-    // PRAGMA user_version read
-    if (/^\s*PRAGMA\s+user_version\s*$/i.test(sql)) {
-      return {
-        get() {
-          try {
-            const r = self._runSyncBlocking(
-              'SELECT version FROM _schema_version WHERE id = 1',
-              []
-            );
-            const row = r.rows?.[0];
-            return { user_version: row ? Number(row.version) : 0 };
-          } catch {
-            return { user_version: 0 };
-          }
-        },
-        all() { return []; },
-        run() {},
-      };
-    }
-    // PRAGMA table_info(tableName)
-    const tableInfo = /^\s*PRAGMA\s+table_info\((\w+)\)/i.exec(sql);
-    if (tableInfo) {
-      const tbl = tableInfo[1];
-      return {
-        get()  { return null; },
-        run()  {},
-        all()  {
-          try {
-            // Turso supports PRAGMA table_info via the HTTP API
-            const r = self._runSyncBlocking(`PRAGMA table_info(${tbl})`, []);
-            return r.rows ?? [];
-          } catch { return []; }
-        },
-      };
-    }
-    return {
-      get(...params) {
-        // Support both .get(a, b, c) and .get([a, b, c]) and .get({key: val})
-        const args = params.length === 1 && !Array.isArray(params[0]) && params[0] !== null && typeof params[0] === 'object'
-          ? Object.values(params[0])
-          : params.flat();
-        const r = self._runSyncBlocking(sql, args);
-        return r.rows?.[0] ?? null;
-      },
-      all(...params) {
-        const args = params.length === 1 && !Array.isArray(params[0]) && params[0] !== null && typeof params[0] === 'object'
-          ? Object.values(params[0])
-          : params.flat();
-        const r = self._runSyncBlocking(sql, args);
-        return r.rows ?? [];
-      },
-      run(...params) {
-        const args = params.length === 1 && !Array.isArray(params[0]) && params[0] !== null && typeof params[0] === 'object'
-          ? Object.values(params[0])
-          : params.flat();
-        const result = self._runSyncBlocking(sql, args);
-        return { changes: result.changes, lastInsertRowid: result.lastInsertRowid == null ? undefined : BigInt(result.lastInsertRowid) };
-      },
-    };
-  }
-}
-
 
 let handle = null;
 
@@ -1604,6 +1339,118 @@ const MIGRATIONS = [
       );
     `);
   },
+
+  // 30 — HEALTH FINDING CATEGORIES: a classification layered OVER findings.
+  //
+  // A category is a theme ("Ownership & Accountability") that groups RULES, not
+  // findings: every finding a rule produces inherits the rule's categories at
+  // READ time. That is why health_findings gains no column here. Denormalising
+  // a category onto each row would mean rewriting history whenever a mapping
+  // changed, and a deleted category would have to reach into finding rows —
+  // the one table this feature must never write.
+  //
+  // GLOBAL, not per instance. A category is a statement about what a rule
+  // MEANS, which does not change with the PDI it ran against; the findings it
+  // is resolved over are still scoped per instance by the store.
+  //
+  // `name_key` is the case-folded, trimmed name, so "Ownership gaps" and
+  // "ownership gaps " cannot both exist. Built-in rows are synced from code
+  // (health/categories.js) rather than inserted here, so the product taxonomy
+  // can change in a release without editing a shipped migration.
+  //
+  // Deleting a category cascades to ITS mappings and nothing else — findings,
+  // runs, lifecycle states and proposals have no reference to either table.
+  //
+  // REPLAY GUARD (added with migration 31, which renames these tables to
+  // health_dimensions / health_dimension_rules): once the renamed table exists,
+  // this migration has already done its work under the new name, so a replay
+  // must not re-create the old tables beside it (phase9-database D6). It
+  // changes nothing for a real database — a fresh one runs 30 then 31, and one
+  // already at 30 or 31 never runs 30 again.
+  (db) => {
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'health_dimensions'").get()) return;
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS health_categories (
+        id           TEXT PRIMARY KEY,
+        name         TEXT NOT NULL,
+        name_key     TEXT NOT NULL UNIQUE,
+        description  TEXT,
+        type         TEXT NOT NULL CHECK (type IN ('built_in', 'custom', 'system')),
+        created_by   TEXT,
+        created_at   TEXT NOT NULL,
+        updated_at   TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS health_category_rules (
+        category_id  TEXT NOT NULL REFERENCES health_categories(id) ON DELETE CASCADE,
+        rule_id      TEXT NOT NULL,
+        source       TEXT NOT NULL CHECK (source IN ('builtin', 'manual', 'matcher', 'ai')),
+        created_at   TEXT NOT NULL,
+        updated_at   TEXT NOT NULL,
+        PRIMARY KEY (category_id, rule_id)
+      );
+
+      -- "Which categories does this rule belong to" and the Uncategorised
+      -- NOT IN subquery both read by rule_id.
+      CREATE INDEX IF NOT EXISTS idx_health_category_rules_rule ON health_category_rules(rule_id);
+    `);
+  },
+
+  // 31 — HEALTH FINDING CATEGORIES ARE NOW "FINDING DIMENSIONS".
+  //
+  // A terminology rename of migration 30's two tables, nothing more: every row
+  // and mapping is kept, every id is kept, and a rule belongs to exactly the
+  // dimensions it belonged to as categories. Migration 30 is left as shipped
+  // (a database already at 30 would never re-run an edited one).
+  //
+  //   health_categories      → health_dimensions
+  //   health_category_rules  → health_dimension_rules  (category_id → dimension_id)
+  //   'uncategorised'        → 'unclassified', the system fallback's id and name
+  //
+  // Not to be confused with the CMDB Quality score's D1–D10 dimensions, which
+  // live in scoring JSON and are untouched by this.
+  //
+  // RENAMES ONLY — no row is deleted and no table or index is dropped, which is
+  // what the no-data-loss guard (phase9-database D2) requires of every shipped
+  // migration. The rules-by-rule_id index moves with its table under its
+  // original name; an index name is not user-visible and dropping it would be
+  // the one destructive statement here.
+  //
+  // REPLAY-SAFE: each rename runs only while the old name exists and the new
+  // one does not. A replayed migration 30 re-creates the two old tables EMPTY
+  // beside the renamed ones; they are left as they are, hold nothing, and
+  // nothing reads them.
+  (db) => {
+    const has = (t) => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(t));
+    const cols = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
+
+    if (has('health_categories') && !has('health_dimensions')) {
+      db.exec('ALTER TABLE health_categories RENAME TO health_dimensions');
+    }
+    if (has('health_category_rules') && !has('health_dimension_rules')) {
+      db.exec('ALTER TABLE health_category_rules RENAME TO health_dimension_rules');
+    }
+    if (has('health_dimension_rules') && cols('health_dimension_rules').includes('category_id')) {
+      db.exec('ALTER TABLE health_dimension_rules RENAME COLUMN category_id TO dimension_id');
+    }
+
+    /* The fallback's new id and name. Parent and children move in one step with
+       the foreign-key check deferred to commit (the runner wraps every
+       migration in a transaction), so no mapping is orphaned even for an
+       instant. A custom dimension already called "Unclassified" keeps its name
+       and the fallback takes an id-qualified key — the same resolution the
+       built-in sync applies to the same clash. */
+    db.exec(`
+      PRAGMA defer_foreign_keys = ON;
+      UPDATE health_dimensions
+         SET id = 'unclassified', name = 'Unclassified',
+             name_key = CASE WHEN EXISTS (SELECT 1 FROM health_dimensions WHERE name_key = 'unclassified')
+                             THEN 'unclassified#unclassified' ELSE 'unclassified' END
+       WHERE id = 'uncategorised'
+         AND NOT EXISTS (SELECT 1 FROM health_dimensions WHERE id = 'unclassified');
+      UPDATE health_dimension_rules SET dimension_id = 'unclassified' WHERE dimension_id = 'uncategorised';
+    `);
+  },
 ];
 
 /**
@@ -1613,38 +1460,11 @@ const MIGRATIONS = [
  * cannot be created directly, and would test a replica rather than the real
  * migrations.
  */
-/**
- * Create the Turso schema-version table if it doesn't exist.
- * This replaces SQLite's PRAGMA user_version for Turso deployments.
- */
-function ensureTursoVersionTable(db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS _schema_version (
-      id      INTEGER PRIMARY KEY,
-      version INTEGER NOT NULL DEFAULT 0,
-      updated_at TEXT NOT NULL DEFAULT ''
-    )
-  `);
-  // Ensure there is always exactly one row with id=1
-  db.exec(`INSERT OR IGNORE INTO _schema_version(id, version, updated_at) VALUES(1, 0, '')`);
-}
-
-
-
-
 export function migrate(db) {
-  const isTurso = USE_TURSO && db instanceof TursoSyncDB;
-
-  if (isTurso) {
-    // Turso: ensure version tracking table exists, skip SQLite-only PRAGMAs
-    ensureTursoVersionTable(db);
-  } else {
-    db.exec('PRAGMA foreign_keys = ON');
-  }
-
+  db.exec('PRAGMA foreign_keys = ON');
   const current = db.prepare('PRAGMA user_version').get().user_version ?? 0;
   for (let v = current; v < MIGRATIONS.length; v++) {
-    if (!isTurso) db.exec('BEGIN');
+    db.exec('BEGIN');
     try {
       /*
        * PHASE 8 — a migration may be a FUNCTION as well as a SQL string.
@@ -1661,10 +1481,10 @@ export function migrate(db) {
       if (typeof MIGRATIONS[v] === 'function') MIGRATIONS[v](db);
       else db.exec(MIGRATIONS[v]);
       db.exec(`PRAGMA user_version = ${v + 1}`);
-      if (!isTurso) db.exec('COMMIT');
+      db.exec('COMMIT');
       log.info('storage', `migration ${v + 1} applied`);
     } catch (err) {
-      if (!isTurso) db.exec('ROLLBACK');
+      db.exec('ROLLBACK');
       // Loud: a half-migrated database is worse than one that refuses to open.
       throw new Error(`NowHelpAssist database migration ${v + 1} failed: ${err.message}`);
     }
@@ -1697,32 +1517,9 @@ function adoptLegacyDatabase() {
   return LEGACY_DB_FILE;
 }
 
-/**
- * Build a TursoSyncDB synchronously using spawnSync to run the async
- * client creation. We actually just instantiate TursoSyncDB directly
- * since createClient is synchronous — only execute() is async.
- */
-function buildTursoSync() {
-  // @libsql/client's createClient() is synchronous; only execute() is async.
-  // We dynamic-import at module load time and cache the client.
-  // Since this file is an ES module and we need sync init, we use
-  // the workerSrc approach inline — the client is created inside each worker.
-  // TursoSyncDB doesn't need a pre-created client; workers create their own.
-  return new TursoSyncDB(null);
-}
-
 /** Opens the database, applying any migrations this file has not yet seen. */
 export function getDb() {
   if (handle) return handle;
-
-  if (USE_TURSO) {
-    log.info('storage', `connecting to Turso: ${TURSO_URL}`);
-    const db = buildTursoSync();
-    handle = migrate(db);
-    return handle;
-  }
-
-  // ── Local SQLite (default) ──────────────────────────────────────────────
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const adopted = adoptLegacyDatabase();
   if (adopted) log.info('storage', `adopted ${path.basename(adopted)} as ${path.basename(DB_FILE)}`);
@@ -1763,5 +1560,4 @@ export function _setDbForTests(db) {
   handle = db;
 }
 
-export const DB_PATH = USE_TURSO ? TURSO_URL : DB_FILE;
-export const IS_TURSO = USE_TURSO;
+export const DB_PATH = DB_FILE;

@@ -1,7 +1,6 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App.jsx';
-import BackendLogin from './components/BackendLogin.jsx';
 import './styles.css';
 /* The agent workspace: status, activity, plan, skills, task history. Its own
    file rather than 250 more lines in styles.css — one feature, one sheet. */
@@ -9,6 +8,11 @@ import './experience.css';
 /* The ROBOTIC theme (Preferences). Every rule is scoped to
    :root[data-theme="robotic"], so it is inert while Black is selected. */
 import './theme-robotic.css';
+/* The ServiceNow theme (Preferences), scoped to :root[data-theme="servicenow"]
+   the same way. */
+import './theme-servicenow.css';
+// Finding dimensions (Health Assist): cards, matrix, manage page, dialog.
+import './health-dimensions.css';
 import { installClientLogging } from './logging.js';
 import { applyTheme, currentTheme } from './theme.js';
 
@@ -20,6 +24,6 @@ applyTheme(currentTheme());
 
 createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <BackendLogin><App /></BackendLogin>
+    <App />
   </React.StrictMode>,
 );
