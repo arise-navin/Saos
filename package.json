@@ -1,6 +1,7 @@
 {
   "name": "nowhelpassist",
   "version": "0.1.0",
+  "type": "module",
   "private": true,
   "scripts": {
     "dev": "node scripts/dev.mjs",
@@ -14,4 +15,3 @@
     "node": ">=22.5.0"
   }
 }
-
