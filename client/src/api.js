@@ -1,6 +1,7 @@
 import { logToServer } from './logging.js';
+import { API_BASE, backendFetch } from './backend.js';
 
-const BASE = '/api';
+const BASE = API_BASE;
 
 /**
  * Every call reports its outcome to the server terminal.
@@ -15,7 +16,7 @@ async function request(method, path, body) {
   let res;
   let text;
   try {
-    res = await fetch(BASE + path, {
+    res = await backendFetch(BASE + path, {
       method,
       headers: body ? { 'Content-Type': 'application/json' } : undefined,
       body: body ? JSON.stringify(body) : undefined,
@@ -65,7 +66,7 @@ async function upload(path, file, signal) {
   const start = Date.now();
   let res;
   try {
-    res = await fetch(BASE + path, {
+    res = await backendFetch(BASE + path, {
       method: 'POST',
       headers: { 'Content-Type': file.type || 'application/octet-stream' },
       body: file,
@@ -134,7 +135,7 @@ function cancelledError() {
 export async function sse(path, body, onEvent, method = 'POST', { signal } = {}) {
   let res;
   try {
-    res = await fetch(BASE + path, {
+    res = await backendFetch(BASE + path, {
       method,
       headers: body ? { 'Content-Type': 'application/json' } : undefined,
       body: body ? JSON.stringify(body) : undefined,

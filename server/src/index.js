@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import { hostingConfig, accessGuard } from './config/hosting.js';
 import { systemRouter } from './routes/system.js';
 import { incidentsRouter } from './routes/incidents.js';
 import { catalogRouter } from './routes/catalog.js';
@@ -35,7 +36,10 @@ import './servicenow/post-install-state.js';
 import { primeCapability } from './servicenow/fluent.js';
 
 const app = express();
-app.use(cors());
+const hosting = hostingConfig();
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
+app.use(cors({ origin: hosting.origins.length ? hosting.origins : true }));
+app.use('/api', accessGuard(hosting.token));
 app.use(express.json({ limit: '2mb' }));
 // Before the routes, so a request is logged even when it 404s.
 app.use(requestLogger());
@@ -124,7 +128,7 @@ export { app };
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1']);
 const HOST = process.env.HOST || '127.0.0.1';
 // On Vercel there is no TCP listener, so the loopback guard does not apply.
-if (!IS_VERCEL && !LOOPBACK.has(HOST)) {
+if (!IS_VERCEL && !hosting.hosted && !LOOPBACK.has(HOST)) {
   log.error('http',
     `refusing to bind ${HOST}: NowHelpAssist is unauthenticated and holds instance admin credentials, ` +
     `and its approval endpoint authorises writes to ${getSettings().connection.instanceUrl || 'the bound instance'}. ` +
@@ -146,7 +150,7 @@ const seeded = seedLedger();
  * capabilities are honestly UNKNOWN; after it they stay known across every
  * TTL refresh (stale-while-revalidate in fluent.js).
  */
-if (!IS_VERCEL) primeCapability();
+if (!IS_VERCEL && !hosting.hosted) primeCapability();
 
 
 let orphans = 0, requeued = 0;
@@ -200,7 +204,7 @@ function start(attempt = 1) {
   server = app.listen(PORT, HOST, () => {
     const s = getSettings();
     banner([
-      `NowHelpAssist  ·  http://localhost:${PORT}   (bound ${HOST} — loopback only)`,
+      `NowHelpAssist  ·  http://localhost:${PORT}   (bound ${HOST})`,
       `instance   ${s.connection.instanceUrl || '(none bound)'}   (both tiers derive from this)`,
       `model      ${s.llm.provider} · ${s.llm.model || '(default)'}`,
       IS_TURSO

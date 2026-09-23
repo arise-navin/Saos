@@ -142,8 +142,12 @@ const { workerData } = require('worker_threads');
       (rs.columns || []).forEach((col, i) => { obj[col] = r[i] ?? null; });
       return obj;
     });
-    const payload = Buffer.from(JSON.stringify({ ok: true, rows, columns: rs.columns }));
-    body.set(payload.slice(0, body.byteLength));
+    const payload = Buffer.from(JSON.stringify({
+      ok: true, rows, columns: rs.columns, changes: rs.rowsAffected,
+      lastInsertRowid: rs.lastInsertRowid == null ? null : String(rs.lastInsertRowid),
+    }));
+    if (payload.length > body.byteLength) throw new Error('Turso result exceeds the synchronous bridge response limit.');
+    body.set(payload);
   } catch (e) {
     const payload = Buffer.from(JSON.stringify({ ok: false, error: e.message }));
     body.set(payload.slice(0, body.byteLength));
@@ -282,7 +286,8 @@ const { workerData } = require('worker_threads');
         const args = params.length === 1 && !Array.isArray(params[0]) && params[0] !== null && typeof params[0] === 'object'
           ? Object.values(params[0])
           : params.flat();
-        self._runSyncBlocking(sql, args);
+        const result = self._runSyncBlocking(sql, args);
+        return { changes: result.changes, lastInsertRowid: result.lastInsertRowid == null ? undefined : BigInt(result.lastInsertRowid) };
       },
     };
   }

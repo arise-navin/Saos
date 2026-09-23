@@ -18,7 +18,8 @@
  *  - **It never blocks a page.** Every failure path is a no-op.
  */
 
-const ENDPOINT = '/api/logs';
+import { API_BASE, backendFetch, REMOTE_BACKEND } from './backend.js';
+const ENDPOINT = `${API_BASE}/logs`;
 const FLUSH_MS = 700;
 const MAX_QUEUE = 200;
 
@@ -37,7 +38,7 @@ function flush(useBeacon = false) {
   queue = [];
   const body = JSON.stringify({ entries });
 
-  if (useBeacon && navigator.sendBeacon) {
+  if (useBeacon && !REMOTE_BACKEND && navigator.sendBeacon) {
     // On unload a fetch is cancelled; a beacon is not. This is how the last
     // error before a crash-and-reload actually reaches the terminal.
     try { navigator.sendBeacon(ENDPOINT, new Blob([body], { type: 'application/json' })); } catch { /* gone */ }
@@ -46,7 +47,7 @@ function flush(useBeacon = false) {
 
   sending = true;
   inTransport = true;
-  fetch(ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body })
+  backendFetch(ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, keepalive: useBeacon })
     .catch(() => { /* the terminal is the nice-to-have; never the app's problem */ })
     .finally(() => { sending = false; inTransport = false; });
 }

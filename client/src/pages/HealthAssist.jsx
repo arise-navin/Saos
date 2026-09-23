@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api } from '../api.js';
 import { SkeletonLines, EmptyState } from '../components/states.jsx';
 import { toast } from '../components/toast.js';
+import { downloadFile } from '../backend.js';
 import RemediationDrawer from '../components/RemediationDrawer.jsx';
 import BulkFixDrawer from '../components/BulkFixDrawer.jsx';
 import { ItsmCatalogue, ItsmParameters, CrossDomainLinks, ItsmFindingDetail } from '../components/HealthItsm.jsx';
@@ -1784,7 +1785,7 @@ export default function HealthAssist() {
           )}
           {/* The export honours the filters on screen. An export that does
               not match what you were looking at is a different report. */}
-          <a className="btn ghost sm" href={exportHref} download>Export CSV</a>
+          <a className="btn ghost sm" href="#" onClick={(event) => { event.preventDefault(); if (run) downloadFile(exportHref, 'health.csv').catch((err) => toast.error(err.message)); }}>Export CSV</a>
           {bulkFixButton}
         </span>
       </div>

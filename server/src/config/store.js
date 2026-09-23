@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { getDb, IS_TURSO } from '../memory/db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.NOWHELPASSIST_DATA_DIR || (process.env.VERCEL
@@ -148,10 +149,28 @@ const DEFAULTS = {
 
 let cache = null;
 
+function settingsDb() {
+  const db = getDb();
+  db.exec('CREATE TABLE IF NOT EXISTS app_settings (id INTEGER PRIMARY KEY, value TEXT NOT NULL)');
+  return db;
+}
+
+function persist(next) {
+  if (IS_TURSO) {
+    settingsDb().prepare('INSERT INTO app_settings (id, value) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET value = excluded.value')
+      .run(JSON.stringify(next));
+  } else {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(FILE, JSON.stringify(next, null, 2));
+  }
+}
+
 function load() {
   if (cache) return cache;
+  // Database failures must surface, not silently replace saved credentials with defaults.
+  const cloudRaw = IS_TURSO ? settingsDb().prepare('SELECT value FROM app_settings WHERE id = 1').get()?.value : null;
   try {
-    const raw = fs.readFileSync(FILE, 'utf8');
+    const raw = IS_TURSO ? (cloudRaw || '{}') : fs.readFileSync(FILE, 'utf8');
     const parsed = JSON.parse(raw);
     cache = {
       connection: { ...DEFAULTS.connection, ...(parsed.connection || {}) },
@@ -266,8 +285,7 @@ export function saveSettings(patch) {
     rag: { ...cur.rag, ...(patch.rag || {}) },
     skills: { ...cur.skills, ...(patch.skills || {}) },
   };
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(FILE, JSON.stringify(next, null, 2));
+  persist(next);
   cache = next;
   announceBinding();
   return next;
@@ -293,8 +311,7 @@ export function saveSettings(patch) {
 export function saveSkills(skills) {
   const cur = load();
   const next = { ...cur, skills: { ...cur.skills, ...(skills || {}) } };
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(FILE, JSON.stringify(next, null, 2));
+  persist(next);
   cache = next;
   return next.skills;
 }
@@ -303,8 +320,7 @@ export function saveSkills(skills) {
 export function clearConnection() {
   const cur = load();
   const next = { ...cur, connection: { ...DEFAULTS.connection } };
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(FILE, JSON.stringify(next, null, 2));
+  persist(next);
   cache = next;
   announceBinding();
   return next;

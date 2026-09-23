@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: saos-api
+    runtime: node
+    plan: free
+    buildCommand: npm ci --prefix server
+    startCommand: node server/src/index.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: 24
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: FRONTEND_ORIGIN
+        sync: false
+      - key: API_ACCESS_TOKEN
+        generateValue: true
+      - key: TURSO_DATABASE_URL
+        value: libsql://saos-v2-navin-patel.aws-ap-south-1.turso.io
+      - key: TURSO_AUTH_TOKEN
+        sync: false

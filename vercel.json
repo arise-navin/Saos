@@ -1,15 +1,9 @@
 {
-  "version": 2,
-  "builds": [
-    { "src": "api/index.js", "use": "@vercel/node", "config": { "helpers": false } },
-    { "src": "package.json", "use": "@vercel/static-build", "config": { "distDir": "client/dist" } }
-  ],
-  "routes": [
-    { "src": "/api/(.*)", "dest": "/api/index.js" },
-    { "handle": "filesystem" },
-    { "src": "/(.*)", "dest": "/index.html" }
-  ],
-  "env": {
-    "NODE_ENV": "production"
-  }
+  "framework": "vite",
+  "installCommand": "npm ci --prefix client --include=dev",
+  "buildCommand": "npm run build --prefix client",
+  "outputDirectory": "client/dist",
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
 }
