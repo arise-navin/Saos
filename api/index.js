@@ -10,7 +10,17 @@ let appPromise;
 export default async function handler(req, res) {
   try {
     // Catch initialization failures too, before Express can install its middleware.
-    appPromise ||= import('../server/src/index.js').then(({ app }) => app);
+    if (!appPromise) {
+      const started = Date.now();
+      console.info('API initialization started', {
+        node: process.version,
+        storage: process.env.TURSO_DATABASE_URL && process.env.TURSO_AUTH_TOKEN ? 'turso' : 'local',
+      });
+      appPromise = import('../server/src/index.js').then(({ app }) => {
+        console.info('API initialization completed', { durationMs: Date.now() - started });
+        return app;
+      });
+    }
     const app = await appPromise;
     return app(req, res);
   } catch (error) {

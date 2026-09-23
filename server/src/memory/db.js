@@ -3,7 +3,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { Worker } from 'node:worker_threads';
+import { createRequire } from 'node:module';
 import { log } from '../logging.js';
+
+const require = createRequire(import.meta.url);
 
 /**
  * One SQLite file for everything NowHelpAssist needs to remember: sessions,
@@ -124,13 +127,14 @@ class TursoSyncDB {
     // in CommonJS context (Node does not treat eval: true as ESM).
     this._workerSrc = `
 const { workerData } = require('worker_threads');
-const { createClient } = require('@libsql/client');
 
 (async () => {
   const flag = new Int32Array(workerData.sab, 0, 1);
   const body = new Uint8Array(workerData.sab, 8);
+  let client;
   try {
-    const client = createClient({ url: workerData.url, authToken: workerData.token });
+    const { createClient } = require(workerData.clientPath);
+    client = createClient({ url: workerData.url, authToken: workerData.token });
     const rs = await client.execute({ sql: workerData.sql, args: workerData.args || [] });
     // Serialize rows — Turso rows are array-like with named properties
     const rows = Array.from(rs.rows).map((r) => {
@@ -146,6 +150,7 @@ const { createClient } = require('@libsql/client');
   } finally {
     Atomics.store(flag, 0, 1);
     Atomics.notify(flag, 0, 1);
+    client?.close();
   }
 })();
 `;
@@ -161,8 +166,12 @@ const { createClient } = require('@libsql/client');
 
     const worker = new Worker(this._workerSrc, {
       eval: true,
-      workerData: { url: TURSO_URL, token: TURSO_TOKEN, sql, args, sab },
+      workerData: {
+        url: TURSO_URL, token: TURSO_TOKEN, sql, args, sab,
+        clientPath: require.resolve('@libsql/client'),
+      },
     });
+    worker.on('error', (error) => log.error('storage', 'Turso worker failed', error));
 
     // Block main thread until worker signals (timeout: 60 s for slow cloud)
     const result = Atomics.wait(flag, 0, 0, 60_000);
