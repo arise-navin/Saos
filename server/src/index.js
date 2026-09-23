@@ -146,7 +146,7 @@ const seeded = seedLedger();
  * capabilities are honestly UNKNOWN; after it they stay known across every
  * TTL refresh (stale-while-revalidate in fluent.js).
  */
-primeCapability();
+if (!IS_VERCEL) primeCapability();
 
 
 let orphans = 0, requeued = 0;

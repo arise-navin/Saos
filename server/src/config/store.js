@@ -3,9 +3,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = process.env.VERCEL
+const DATA_DIR = process.env.NOWHELPASSIST_DATA_DIR || (process.env.VERCEL
   ? path.join('/tmp', 'nowhelpassist')
-  : path.resolve(__dirname, '../../data');
+  : path.resolve(__dirname, '../../data'));
 const FILE = path.join(DATA_DIR, 'settings.json');
 
 const DEFAULTS = {

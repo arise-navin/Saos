@@ -4,7 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "install": "npm install --prefix server && npm install --prefix client",
+    "install": "npm ci --prefix server && npm ci --prefix client --include=dev",
     "dev": "node scripts/dev.mjs",
     "dev:server": "npm run dev --prefix server",
     "dev:client": "npm run dev --prefix client",
@@ -13,6 +13,6 @@
     "test": "npm test --prefix server"
   },
   "engines": {
-    "node": ">=22.5.0"
+    "node": "24.x"
   }
 }

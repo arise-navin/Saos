@@ -28,9 +28,9 @@ import { log } from '../logging.js';
  */
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = process.env.VERCEL
+const DATA_DIR = process.env.NOWHELPASSIST_DATA_DIR || (process.env.VERCEL
   ? path.join('/tmp', 'nowhelpassist')
-  : path.resolve(__dirname, '../../data');
+  : path.resolve(__dirname, '../../data'));
 const DB_FILE = path.join(DATA_DIR, 'nowhelpassist.db');
 const LEGACY_DB_FILE = path.join(DATA_DIR, 'nowforge.db');
 

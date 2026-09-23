@@ -225,6 +225,9 @@ export function npmInvocation() {
  * this; nothing else spawns npm.
  */
 export async function autoBootstrapSdkWorkspace() {
+  if (process.env.VERCEL) {
+    return { attempted: false, ok: false, reason: 'SDK installation requires the local server; the Vercel deployment filesystem is read-only.' };
+  }
   const entry = localSdkEntry();
   if (sdkWorkspaceInstalled()) {
     return { attempted: false, ok: true, reason: 'local SDK already installed', entry };
