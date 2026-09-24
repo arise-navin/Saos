@@ -66,6 +66,19 @@ import { listSkills, toolsForSkills, skillsForProfile, skillContextBlock, active
  * whose authority every following instruction carries.
  */
 const IMPERSONATION_GATED_TOOLS = new Set(['impersonation_start', 'impersonation_switch']);
+const GROQ_COMPACT_CAPABILITIES = ['core', 'record_read', 'schema_read', 'incident', 'knowledge', 'memory'];
+const GROQ_COMPACT_TOOLS = new Set([
+  'test_connection',
+  'get_table_schema',
+  'lookup_reference',
+  'lookup_table',
+  'query_records',
+  'get_record',
+  'create_incident',
+  'recall_memory',
+  'list_instance_facts',
+  'search_servicenow_docs',
+]);
 
 const live = new Map(); // sessionId -> { pending: Map<approvalId, resolver> }
 
@@ -1681,6 +1694,19 @@ export async function runTurn(sessionId, userText, emit, { retry = false, signal
   const sessionLive = liveState(sessionId);
   const priorCapabilities = sessionLive.lastCapabilities ?? null;
   let profile = buildContextProfile({ goal: userText, tools: surface.tools, capability: null, priorCapabilities });
+  if (getSettings().llm?.provider === 'groq') {
+    const compact = buildContextProfile({
+      goal: userText,
+      tools: surface.tools.filter((t) => GROQ_COMPACT_TOOLS.has(t.name)),
+      capability: GROQ_COMPACT_CAPABILITIES,
+      priorCapabilities: null,
+    });
+    profile = Object.freeze({
+      ...compact,
+      fallbackReason: compact.fallbackReason || 'groq_compact_token_budget',
+    });
+    log.warn('llm', `Groq compact mode: exposing ${profile.tools.length}/${surface.tools.length} tools to stay under low TPM limits.`);
+  }
   if (profile.capabilities) sessionLive.lastCapabilities = profile.capabilities;
   {
     const diag = contextDiagnostics(profile, { allTools: surface.tools });

@@ -33,11 +33,7 @@ let inTransport = false;
 const route = () => `${window.location.pathname}${window.location.search}`;
 const authHeaders = () => {
   const token = localStorage.getItem('saos.apiToken') || API_TOKEN;
-  const session = localStorage.getItem('saos.userToken') || '';
-  return {
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    ...(session ? { 'X-SAOS-Session': session } : {}),
-  };
+  return token ? { Authorization: `Bearer ${token}` } : {};
 };
 
 function flush(useBeacon = false) {

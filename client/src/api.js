@@ -5,10 +5,7 @@ const API_TOKEN = import.meta.env.VITE_API_ACCESS_TOKEN || '';
 
 function headers(extra = {}) {
   const token = localStorage.getItem('saos.apiToken') || API_TOKEN;
-  const session = localStorage.getItem('saos.userToken') || '';
-  const out = token ? { ...extra, Authorization: `Bearer ${token}` } : { ...extra };
-  if (session) out['X-SAOS-Session'] = session;
-  return out;
+  return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
 }
 
 /**

@@ -102,6 +102,7 @@ const DOCUMENTED_CONTEXT = {
   'o3': 200_000,
   'claude-sonnet-4-5': 200_000,
   'claude-opus-4-5': 200_000,
+  'openai/gpt-oss-120b': 8_192,
 };
 
 /** Used when nothing else is known. Small on purpose: guessing high fails hard. */
@@ -180,8 +181,9 @@ export async function computeBudget({ system, tools, maxTokens = 4096 } = {}) {
   const systemTokens = estimateTextTokens(system);
   const toolSchemaTokens = estimateTextTokens(JSON.stringify(tools ?? []));
   const fixed = systemTokens + toolSchemaTokens;
-  const headroom = Math.max(OUTPUT_HEADROOM, maxTokens);
-  const ceiling = Math.min(modelCtx, SANE_CONTEXT_CAP);
+  const groqLowTier = llm.provider === 'groq';
+  const headroom = groqLowTier ? 1024 : Math.max(OUTPUT_HEADROOM, maxTokens);
+  const ceiling = groqLowTier ? Math.min(modelCtx, 7_500) : Math.min(modelCtx, SANE_CONTEXT_CAP);
   /*
    * WI-BUDGET-1 — STARVATION, SAID OUT LOUD.
    *
@@ -200,7 +202,8 @@ export async function computeBudget({ system, tools, maxTokens = 4096 } = {}) {
    * is what this whole file exists to stop.
    */
   const starved = fixed + headroom >= ceiling;
-  const budget = Math.max(MIN_HISTORY_TOKENS, ceiling - fixed - headroom);
+  const minHistory = groqLowTier ? 500 : MIN_HISTORY_TOKENS;
+  const budget = Math.max(minHistory, ceiling - fixed - headroom);
 
   if (starved) reportStarvation({ fixed, headroom, ceiling, budget, tools });
 

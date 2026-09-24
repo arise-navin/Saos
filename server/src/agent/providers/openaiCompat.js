@@ -71,6 +71,7 @@ export const REASONING_RETRY_MAX_TOKENS = 16_384;
 const REASONING_RETRY_TIMEOUT_MS = 4 * LLM_REQUEST_TIMEOUT_MS;
  
 export const WARMUP_TIMEOUT_MS = 15_000;
+const GROQ_LOW_TIER_TARGET_TOKENS = 6_500;
 
 /**
  * `AbortSignal.timeout` rejects with a TimeoutError. undici sometimes surfaces
@@ -78,6 +79,45 @@ export const WARMUP_TIMEOUT_MS = 15_000;
  * checked — reading only the outer error reports a timeout as a dead daemon.
  */
 const isTimeout = (err) => err?.name === 'TimeoutError' || err?.cause?.name === 'TimeoutError';
+
+function groqEstimate(body) {
+  return estimateTextTokens(JSON.stringify({
+    messages: body.messages || [],
+    tools: body.tools || [],
+  })) + Number(body.max_tokens || 0);
+}
+
+function fitGroqRequest(body) {
+  body.max_tokens = Math.min(Number(body.max_tokens) || 512, 512);
+  let estimate = groqEstimate(body);
+  if (estimate <= GROQ_LOW_TIER_TARGET_TOKENS) return null;
+
+  const report = {
+    originalEstimate: estimate,
+    finalEstimate: estimate,
+    droppedMessages: 0,
+    droppedTools: false,
+  };
+
+  const system = body.messages.find((m) => m.role === 'system');
+  const rest = body.messages.filter((m) => m !== system);
+  while (rest.length > 1 && estimate > GROQ_LOW_TIER_TARGET_TOKENS) {
+    rest.shift();
+    report.droppedMessages += 1;
+    body.messages = system ? [system, ...rest] : [...rest];
+    estimate = groqEstimate(body);
+  }
+
+  if (estimate > GROQ_LOW_TIER_TARGET_TOKENS && body.tools?.length) {
+    delete body.tools;
+    delete body.tool_choice;
+    report.droppedTools = true;
+    estimate = groqEstimate(body);
+  }
+
+  report.finalEstimate = estimate;
+  return report;
+}
 
 /**
  * Phase 0 — the request timeout, and the caller's cancellation, as one signal.
@@ -278,7 +318,7 @@ export async function chat({ provider, apiKey, baseUrl, model, system, history, 
 
   const body = {
     model: resolvedModel,
-    max_tokens: maxTokens,
+    max_tokens: provider === 'groq' ? Math.min(maxTokens, 1024) : maxTokens,
     messages,
   };
   // A1 passthrough. Both knobs exist on this wire format, so both are sent.
@@ -293,6 +333,14 @@ export async function chat({ provider, apiKey, baseUrl, model, system, history, 
     }));
     body.tool_choice = 'auto';
   }
+  if (provider === 'groq') {
+    const fitted = fitGroqRequest(body);
+    if (fitted) {
+      log.warn('llm',
+        `Groq request fitted from ~${fitted.originalEstimate} to ~${fitted.finalEstimate} tokens ` +
+        `(${fitted.droppedMessages} older message(s) removed${fitted.droppedTools ? ', tool schemas omitted for this analysis call' : ''}).`);
+    }
+  }
   const headers = { 'Content-Type': 'application/json' };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
   // Provider-specific extras (OpenRouter's optional attribution headers). Kept
@@ -300,6 +348,7 @@ export async function chat({ provider, apiKey, baseUrl, model, system, history, 
   // rather than provider-aware.
   if (extraHeaders) for (const [k, v] of Object.entries(extraHeaders)) if (v) headers[k] = v;
 
+  let groqRetriedWithoutTools = false;
   const data = await withRetry(
     `${provider} chat`,
     // `attempt` so a persisted failure can say how many tries it took (F13).
@@ -349,6 +398,20 @@ export async function chat({ provider, apiKey, baseUrl, model, system, history, 
       if (!res.ok) {
         const err = new Error(parsed?.error?.message || `${provider} API error (${res.status})`);
         err.status = res.status;
+        if (
+          provider === 'groq'
+          && res.status === 429
+          && body.tools?.length
+          && /request too large|tokens per minute|TPM/i.test(err.message)
+          && !groqRetriedWithoutTools
+        ) {
+          delete body.tools;
+          delete body.tool_choice;
+          body.max_tokens = Math.min(Number(body.max_tokens) || 512, 512);
+          groqRetriedWithoutTools = true;
+          log.warn('llm', 'Groq rejected the tool-call request as too large; retrying once as analysis-only without tool schemas.');
+          throw retryable(err, 429);
+        }
         // A 4xx is our malformed request; retrying it three times only makes a
         // clear bug slower to find.
         if (isRetryableStatus(res.status)) err.retryable = true;
@@ -478,7 +541,7 @@ export async function chat({ provider, apiKey, baseUrl, model, system, history, 
         // When the reasoning is visible, the cause is known and so is the remedy:
         // not the same request again, but one with room to think. Once only —
         // the raised budget is not raised again (REASONING_RETRY_MAX_TOKENS).
-        if (reasoned && body.max_tokens < REASONING_RETRY_MAX_TOKENS) {
+        if (provider !== 'groq' && reasoned && body.max_tokens < REASONING_RETRY_MAX_TOKENS) {
           const spent = body.max_tokens;
           const e = err(new Error(
             `${provider} returned no content: the max_tokens budget (${spent}) was exhausted by reasoning — ` +
