@@ -2,18 +2,21 @@
 
 ## Render
 
-Create a Blueprint from this repo. `render.yaml` installs `server/`, starts
-`server/src/index.js`, exposes `/healthz`, and mounts a persistent disk at
-`/var/data/saos` for the current SQLite-backed app data.
+Create a Blueprint from this repo. `render.yaml` installs `server/`, installs
+the ServiceNow SDK workspace with dev dependencies, starts `server/src/index.js`,
+and exposes `/healthz`.
 
 Set these Render environment variables:
 
 - `FRONTEND_ORIGIN`: your Vercel origin, for example `https://saos.vercel.app`
 - `API_ACCESS_TOKEN`: a long secret used by the frontend to call `/api`
-- `SAOS_DATA_DIR`: `/var/data/saos`
+- `SAOS_DATA_DIR`: `/tmp/saos` on Render free, or a mounted persistent disk path on a paid service
 
-The Turso URL/token must stay secret. This codebase is not yet wired to libSQL,
-so Render persistence currently comes from the mounted disk.
+The current backend stores app users, sessions, saved ServiceNow credentials,
+LLM settings, chats, and scan state in its SQLite database. On Render free,
+`/tmp` survives ordinary page reloads but not guaranteed service restarts or
+redeploys. For permanent production persistence use a Render persistent disk or
+convert the storage layer to Turso/libSQL.
 
 ## Vercel
 
@@ -31,6 +34,10 @@ localStorage.setItem('saos.apiToken', 'YOUR_RENDER_API_ACCESS_TOKEN')
 ```
 
 Then refresh the app.
+
+The first page is now a SAOS account screen. Create the first user with name,
+email, and password; later visits require that login before the dashboard opens.
+Groq can be selected from Settings and uses the API key entered in the UI.
 
 ## Ollama
 

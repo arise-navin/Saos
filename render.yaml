@@ -3,13 +3,9 @@ services:
     name: saos-api
     runtime: node
     plan: free
-    buildCommand: npm ci --prefix server
+    buildCommand: npm ci --prefix server && npm ci --prefix server/fluent-workspace --include=dev
     startCommand: node server/src/index.js
     healthCheckPath: /healthz
-    disk:
-      name: saos-data
-      mountPath: /var/data/saos
-      sizeGB: 1
     envVars:
       - key: NODE_VERSION
         value: 24
@@ -18,7 +14,7 @@ services:
       - key: RENDER
         value: "true"
       - key: SAOS_DATA_DIR
-        value: /var/data/saos
+        value: /tmp/saos
       - key: FRONTEND_ORIGIN
         sync: false
       - key: API_ACCESS_TOKEN

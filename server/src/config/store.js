@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
+import { getDb } from '../memory/db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(process.env.SAOS_DATA_DIR || path.resolve(__dirname, '../../data'));
@@ -145,11 +147,53 @@ const DEFAULTS = {
 };
 
 let cache = null;
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+function appDb() {
+  const db = getDb();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      id INTEGER PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS saos_users (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS saos_sessions (
+      token TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES saos_users(id) ON DELETE CASCADE
+    );
+  `);
+  return db;
+}
+
+function persist(next) {
+  const db = appDb();
+  db.prepare(`
+    INSERT INTO app_settings (id, value, updated_at)
+    VALUES (1, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `).run(JSON.stringify(next), new Date().toISOString());
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(FILE, JSON.stringify(next, null, 2));
+  } catch { /* database is the durable source */ }
+}
 
 function load() {
   if (cache) return cache;
   try {
-    const raw = fs.readFileSync(FILE, 'utf8');
+    const raw = appDb().prepare('SELECT value FROM app_settings WHERE id = 1').get()?.value
+      || fs.readFileSync(FILE, 'utf8');
     const parsed = JSON.parse(raw);
     cache = {
       connection: { ...DEFAULTS.connection, ...(parsed.connection || {}) },
@@ -264,8 +308,7 @@ export function saveSettings(patch) {
     rag: { ...cur.rag, ...(patch.rag || {}) },
     skills: { ...cur.skills, ...(patch.skills || {}) },
   };
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(FILE, JSON.stringify(next, null, 2));
+  persist(next);
   cache = next;
   announceBinding();
   return next;
@@ -291,8 +334,7 @@ export function saveSettings(patch) {
 export function saveSkills(skills) {
   const cur = load();
   const next = { ...cur, skills: { ...cur.skills, ...(skills || {}) } };
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(FILE, JSON.stringify(next, null, 2));
+  persist(next);
   cache = next;
   return next.skills;
 }
@@ -301,11 +343,92 @@ export function saveSkills(skills) {
 export function clearConnection() {
   const cur = load();
   const next = { ...cur, connection: { ...DEFAULTS.connection } };
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(FILE, JSON.stringify(next, null, 2));
+  persist(next);
   cache = next;
   announceBinding();
   return next;
+}
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return `scrypt:${salt}:${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  const [, salt, hash] = String(stored || '').split(':');
+  if (!salt || !hash) return false;
+  const actual = Buffer.from(hashPassword(password, salt).split(':')[2], 'hex');
+  const expected = Buffer.from(hash, 'hex');
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+function publicUser(row) {
+  return row ? { id: row.id, name: row.name, email: row.email } : null;
+}
+
+export function hasSaosUser() {
+  return Boolean(appDb().prepare('SELECT 1 FROM saos_users LIMIT 1').get());
+}
+
+export function createSaosUser({ name, email, password }) {
+  const cleanName = String(name || '').trim();
+  const cleanEmail = String(email || '').trim().toLowerCase();
+  if (!cleanName) throw Object.assign(new Error('Name is required.'), { status: 400 });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+    throw Object.assign(new Error('A valid email address is required.'), { status: 400 });
+  }
+  if (String(password || '').length < 8) {
+    throw Object.assign(new Error('Password must be at least 8 characters.'), { status: 400 });
+  }
+  const db = appDb();
+  const now = new Date().toISOString();
+  const user = { id: crypto.randomUUID(), name: cleanName, email: cleanEmail };
+  try {
+    db.prepare(`
+      INSERT INTO saos_users (id, name, email, password_hash, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(user.id, user.name, user.email, hashPassword(password), now, now);
+  } catch (err) {
+    if (/UNIQUE/i.test(err.message)) throw Object.assign(new Error('That email is already registered.'), { status: 409 });
+    throw err;
+  }
+  return { user, session: createSaosSession(user.id) };
+}
+
+export function createSaosSession(userId) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const now = new Date();
+  const expires = new Date(now.getTime() + SESSION_TTL_MS);
+  appDb().prepare('INSERT INTO saos_sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)')
+    .run(token, userId, now.toISOString(), expires.toISOString());
+  return { token, expiresAt: expires.toISOString() };
+}
+
+export function loginSaosUser({ email, password }) {
+  const row = appDb().prepare('SELECT * FROM saos_users WHERE email = ?').get(String(email || '').trim().toLowerCase());
+  if (!row || !verifyPassword(password, row.password_hash)) {
+    throw Object.assign(new Error('Invalid email or password.'), { status: 401 });
+  }
+  return { user: publicUser(row), session: createSaosSession(row.id) };
+}
+
+export function userForSaosToken(token) {
+  if (!token) return null;
+  const row = appDb().prepare(`
+    SELECT u.id, u.name, u.email, s.expires_at
+      FROM saos_sessions s JOIN saos_users u ON u.id = s.user_id
+     WHERE s.token = ?
+  `).get(token);
+  if (!row) return null;
+  if (Date.parse(row.expires_at) <= Date.now()) {
+    appDb().prepare('DELETE FROM saos_sessions WHERE token = ?').run(token);
+    return null;
+  }
+  return publicUser(row);
+}
+
+export function logoutSaosToken(token) {
+  if (token) appDb().prepare('DELETE FROM saos_sessions WHERE token = ?').run(token);
 }
 
 /** Redacts secrets for sending to the client. */

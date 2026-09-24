@@ -23,6 +23,7 @@ import { RequiresInstance } from './components/states.jsx';
 import Sidebar from './components/Sidebar.jsx';
 import PlaygroundBackground from './components/PlaygroundBackground.jsx';
 import SAOSLoadingScreen from './components/SAOSLoadingScreen.jsx';
+import AuthGate from './components/AuthGate.jsx';
 import { discoverHealthRun } from './components/healthRun.js';
 
 const TITLES = {
@@ -198,7 +199,8 @@ function Shell() {
 export default function App() {
   return (
     <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-      <Shell />
+      <AuthGate>
+        <Shell />
       {/* Mounted once, outside the routed content: a toast raised by a page
           that is navigating away must still be readable, the dialog must
           outlive the row that opened it, and neither may be unmounted by the
@@ -218,6 +220,7 @@ export default function App() {
           once the real startup signals land, and App never remounts, so no
           navigation can bring it back. */}
       <SAOSLoadingScreen />
+      </AuthGate>
     </BrowserRouter>
   );
 }

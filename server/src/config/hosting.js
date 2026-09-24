@@ -16,9 +16,11 @@ export function hostingConfig(env = process.env) {
   return { hosted, token, origins };
 }
 
-export function accessGuard(token) {
+export function accessGuard(token, { sessionUser = null } = {}) {
   return (req, res, next) => {
     if (!token) return next();
+    if (req.path.startsWith('/system/auth/')) return next();
+    if (sessionUser?.(req.get('x-saos-session') || '')) return next();
     const actual = Buffer.from(req.get('authorization') || '');
     const expected = Buffer.from(`Bearer ${token}`);
     if (actual.length === expected.length && timingSafeEqual(actual, expected)) return next();

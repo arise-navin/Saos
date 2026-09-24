@@ -12,10 +12,11 @@ import * as openaiCompat from './openaiCompat.js';
  * special-casing beyond a base URL, a credential check and its optional
  * attribution headers.
  */
-const OPENAI_COMPATIBLE = new Set(['openai', 'ollama', 'openrouter', 'opencode']);
+const OPENAI_COMPATIBLE = new Set(['openai', 'groq', 'ollama', 'openrouter', 'opencode']);
 
 const KEY_REQUIRED = {
   openai: 'OpenAI API key not set. Add it in Settings.',
+  groq: 'Groq API key not set. Add it in Settings.',
   openrouter: 'OpenRouter API key not set. Add it in Settings — it is the key from openrouter.ai/keys.',
 };
 

@@ -11,6 +11,7 @@ import { withRetry, retryable, isRetryableStatus, isColdStart, isAbort, abortedE
 
 const DEFAULTS = {
   openai: { baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o' },
+  groq: { baseUrl: 'https://api.groq.com/openai/v1', model: 'openai/gpt-oss-120b' },
   ollama: { baseUrl: 'http://localhost:11434/v1', model: 'llama3.1' },
   /*
    * OpenRouter is OpenAI-compatible, VERIFIED against the live API rather

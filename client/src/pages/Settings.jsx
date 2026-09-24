@@ -11,6 +11,7 @@ import ThemePicker from '../components/ThemePicker.jsx';
 const HINTS = {
   anthropic: { model: 'claude-sonnet-4-6', baseUrl: 'api.anthropic.com (fixed)', key: true },
   openai: { model: 'gpt-4o', baseUrl: 'https://api.openai.com/v1', key: true },
+  groq: { model: 'openai/gpt-oss-120b', baseUrl: 'https://api.groq.com/openai/v1', key: true },
   ollama: { model: 'llama3.1 (tool-capable model required)', baseUrl: 'http://localhost:11434/v1', key: false },
   // No default model: OpenRouter fronts hundreds of vendor/model ids and one
   // has to be chosen. The picker below loads them live rather than shipping a
@@ -162,6 +163,7 @@ export default function Settings() {
           <select className="select" value={llm.provider} onChange={(e) => setLlm({ ...llm, provider: e.target.value, baseUrl: '', model: '' })}>
             <option value="anthropic">Anthropic (Claude)</option>
             <option value="openai">OpenAI</option>
+            <option value="groq">Groq</option>
             <option value="ollama">Ollama (local)</option>
             <option value="openrouter">OpenRouter</option>
             <option value="opencode">OpenCode-compatible (self-hosted)</option>
@@ -259,9 +261,9 @@ export default function Settings() {
         <div className="card-title">Notes</div>
         <div className="stack">
           <div className="note">
-            Credentials and API keys are stored locally in <span className="mono">server/data/settings.json</span> on
-            your machine — never sent anywhere except the instance / provider you configured. Keep that folder out of
-            version control (it's gitignored).
+            Credentials and API keys are stored by the backend in its database settings table, with
+            <span className="mono"> server/data/settings.json</span> kept as a local development fallback. They are never
+            sent anywhere except the instance / provider you configured.
           </div>
           <div className="note">
             Ollama runs fully local: point the base URL at <span className="mono">http://localhost:11434/v1</span> and

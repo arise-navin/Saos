@@ -25,7 +25,7 @@ import { log, requestLogger, banner } from './logging.js';
 import { SnowError } from './servicenow/client.js';
 import { getDb } from './memory/db.js';
 import { seedLedger } from './memory/facts.js';
-import { getSettings } from './config/store.js';
+import { getSettings, userForSaosToken } from './config/store.js';
 import { accessGuard, hostingConfig } from './config/hosting.js';
 // Loaded for its side effect: registers the instance-switch hook on config/store
 // so no path can save a connection without per-instance state being flushed (B6).
@@ -43,7 +43,7 @@ app.use(express.json({ limit: '2mb' }));
 // Before the routes, so a request is logged even when it 404s.
 app.use(requestLogger());
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
-app.use('/api', accessGuard(hosting.token));
+app.use('/api', accessGuard(hosting.token, { sessionUser: userForSaosToken }));
 
 app.use('/api/system', systemRouter);
 app.use('/api/incidents', incidentsRouter);

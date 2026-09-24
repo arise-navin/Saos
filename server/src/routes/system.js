@@ -1,5 +1,8 @@
 import { Router } from 'express';
-import { getSettings, saveSettings, publicSettings, clearConnection } from '../config/store.js';
+import {
+  getSettings, saveSettings, publicSettings, clearConnection,
+  createSaosUser, hasSaosUser, loginSaosUser, logoutSaosToken, userForSaosToken,
+} from '../config/store.js';
 import { testConnection, resetAuthCache } from '../servicenow/client.js';
 import { getSchema, referenceLookup, tableLookup, clearSchemaCaches, getTableHierarchy } from '../servicenow/schema.js';
 import { capability, cachedCapability, forgetInstanceState } from '../servicenow/fluent.js';
@@ -10,6 +13,31 @@ import { bindingStatus, invalidateBindingStatus } from '../servicenow/binding-st
 import { autoSetupSdk, sdkSetupStatus } from '../servicenow/sdk-setup.js';
 
 export const systemRouter = Router();
+
+function bearer(req) {
+  return req.get('x-saos-session') || '';
+}
+
+systemRouter.get('/auth/status', (req, res) => {
+  const user = userForSaosToken(bearer(req));
+  res.json({ configured: hasSaosUser(), authenticated: Boolean(user), user });
+});
+
+systemRouter.post('/auth/register', (req, res, next) => {
+  try {
+    if (hasSaosUser()) throw Object.assign(new Error('SAOS user already exists. Please log in.'), { status: 409 });
+    res.json(createSaosUser(req.body || {}));
+  } catch (err) { next(err); }
+});
+
+systemRouter.post('/auth/login', (req, res, next) => {
+  try { res.json(loginSaosUser(req.body || {})); } catch (err) { next(err); }
+});
+
+systemRouter.post('/auth/logout', (req, res) => {
+  logoutSaosToken(bearer(req));
+  res.json({ ok: true });
+});
 
 /**
  * The one source of truth for "is an instance bound" (D-3), which means every

@@ -11,5 +11,9 @@
   },
   "engines": {
     "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.3",
+    "groq-sdk": "^1.6.0"
   }
 }
