@@ -2,6 +2,7 @@ import { Router } from 'express';
 import {
   getSettings, saveSettings, publicSettings, clearConnection,
   createSaosUser, hasSaosUser, loginSaosUser, logoutSaosToken, userForSaosToken,
+  settingsStorageStatus,
 } from '../config/store.js';
 import { testConnection, resetAuthCache } from '../servicenow/client.js';
 import { getSchema, referenceLookup, tableLookup, clearSchemaCaches, getTableHierarchy } from '../servicenow/schema.js';
@@ -103,6 +104,7 @@ systemRouter.get('/binding', async (req, res) => {
 });
 
 systemRouter.get('/settings', (_req, res) => res.json(publicSettings()));
+systemRouter.get('/settings/storage', (_req, res) => res.json(settingsStorageStatus()));
 
 systemRouter.post('/settings', (req, res) => {
   const { connection, llm, agent } = req.body || {};

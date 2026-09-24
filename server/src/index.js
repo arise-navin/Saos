@@ -25,7 +25,7 @@ import { log, requestLogger, banner } from './logging.js';
 import { SnowError } from './servicenow/client.js';
 import { getDb } from './memory/db.js';
 import { seedLedger } from './memory/facts.js';
-import { getSettings, userForSaosToken } from './config/store.js';
+import { getSettings, initSettingsStore, userForSaosToken } from './config/store.js';
 import { accessGuard, hostingConfig } from './config/hosting.js';
 // Loaded for its side effect: registers the instance-switch hook on config/store
 // so no path can save a connection without per-instance state being flushed (B6).
@@ -139,6 +139,7 @@ if (!hosting.hosted && !LOOPBACK.has(HOST)) {
 // database that cannot open should stop the server rather than fail the first
 // chat turn with something unrecognisable.
 getDb();
+await initSettingsStore();
 const seeded = seedLedger();
 
 /*

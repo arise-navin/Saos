@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
+import { createClient } from '@libsql/client';
 import { getDb } from '../memory/db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -148,6 +149,85 @@ const DEFAULTS = {
 
 let cache = null;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+let cloud = null;
+let cloudReady = false;
+let cloudStatus = { configured: false, ready: false, error: null };
+
+function cloudClient() {
+  if (cloud !== null) return cloud;
+  const url = process.env.TURSO_DATABASE_URL || '';
+  const authToken = process.env.TURSO_AUTH_TOKEN || '';
+  cloudStatus.configured = Boolean(url && authToken);
+  cloud = url && authToken ? createClient({ url, authToken }) : false;
+  return cloud || null;
+}
+
+async function ensureCloudSettings() {
+  const client = cloudClient();
+  if (!client) return null;
+  await client.execute(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      id INTEGER PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `);
+  return client;
+}
+
+export async function initSettingsStore() {
+  if (cloudReady) return cache;
+  const client = await ensureCloudSettings();
+  if (!client) { cloudReady = true; return load(); }
+  let rs;
+  try {
+    rs = await client.execute('SELECT value FROM app_settings WHERE id = 1');
+    cloudStatus = { configured: true, ready: true, error: null };
+  } catch (err) {
+    cloudStatus = { configured: true, ready: false, error: err.message };
+    cloudReady = true;
+    return load();
+  }
+  const raw = rs.rows?.[0]?.value;
+  if (raw) {
+    const parsed = JSON.parse(String(raw));
+    cache = {
+      connection: { ...DEFAULTS.connection, ...(parsed.connection || {}) },
+      llm: { ...DEFAULTS.llm, ...(parsed.llm || {}) },
+      agent: { ...DEFAULTS.agent, ...(parsed.agent || {}) },
+      dba: { ...DEFAULTS.dba, ...(parsed.dba || {}) },
+      rag: { ...DEFAULTS.rag, ...(parsed.rag || {}) },
+      skills: { ...DEFAULTS.skills, ...(parsed.skills || {}) },
+    };
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(FILE, JSON.stringify(cache, null, 2));
+    } catch { /* local cache is optional */ }
+  } else {
+    const local = load();
+    await saveCloudSettings(local);
+  }
+  cloudReady = true;
+  return load();
+}
+
+export function settingsStorageStatus() {
+  return { ...cloudStatus, localPath: FILE };
+}
+
+async function saveCloudSettings(next) {
+  const client = await ensureCloudSettings();
+  if (!client) return false;
+  await client.execute({
+    sql: `
+      INSERT INTO app_settings (id, value, updated_at)
+      VALUES (1, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `,
+    args: [JSON.stringify(next), new Date().toISOString()],
+  });
+  return true;
+}
 
 function appDb() {
   const db = getDb();
@@ -187,6 +267,9 @@ function persist(next) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.writeFileSync(FILE, JSON.stringify(next, null, 2));
   } catch { /* database is the durable source */ }
+  saveCloudSettings(next)
+    .then(() => { if (cloudStatus.configured) cloudStatus = { configured: true, ready: true, error: null }; })
+    .catch((err) => { cloudStatus = { configured: true, ready: false, error: err.message }; });
 }
 
 function load() {
